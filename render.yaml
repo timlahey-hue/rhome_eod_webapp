@@ -2,11 +2,10 @@
 services:
   - type: web
     name: rhome-eod-dashboard
-    env: python
+    runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: bash -lc 'ln -sf /data/eod.db ./eod.db; uvicorn app.main:app --host 0.0.0.0 --port $PORT'
-    autoDeploy: true
     healthCheckPath: /health
     disk:
       name: eod-snapshots
@@ -16,26 +15,27 @@ services:
       - key: SIMPRO_BASE_URL
         value: https://rhome.simprosuite.com
       - key: SIMPRO_CLIENT_ID
-        sync: false   # fill in on Render
+        sync: false
       - key: SIMPRO_CLIENT_SECRET
-        sync: false   # fill in on Render
+        sync: false
       - key: SIMPRO_COMPANY_ID
-        sync: false   # optional
+        sync: false
       - key: SLACK_WEBHOOK_URL
-        sync: false   # optional
+        sync: false
       - key: TZ
         value: America/Chicago
-cronJobs:
-  - name: eod-live-ingest
-    env: python
-    plan: free
-    buildCommand: echo "no build needed"
-    # Call the web app's endpoint so the DB updates on the web service's disk
-    startCommand: bash -lc 'curl -fsS -X POST "$DASHBOARD_URL/ingest/live" || exit 1'
-    schedule: "0 22 * * *"   # 5:00 pm Chicago during Daylight Time (CDT)
+
+  # Cron job defined as a service (correct way)
+  - type: cron
+    name: eod-live-ingest
+    runtime: python
+    schedule: "0 22 * * *"  # 5:00 pm Chicago during Daylight Time (use 23:00 in CST if you want year-round 5pm)
+    buildCommand: "true"
+    # Call the web app so the ingest runs where the disk is mounted
+    startCommand: bash -lc 'curl -fsS -X POST "http://$DASHBOARD_HOSTPORT/ingest/live" || exit 1'
     envVars:
-      - key: DASHBOARD_URL
+      - key: DASHBOARD_HOSTPORT
         fromService:
           name: rhome-eod-dashboard
           type: web
-          property: url
+          property: hostport
