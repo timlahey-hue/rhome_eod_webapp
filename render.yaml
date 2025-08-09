@@ -1,0 +1,46 @@
+# Render Blueprint: r:home EOD Web Dashboard
+services:
+  - type: web
+    name: rhome-eod-dashboard
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash -lc 'ln -sf /data/eod.db ./eod.db; uvicorn app.main:app --host 0.0.0.0 --port $PORT'
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: eod-snapshots
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: SIMPRO_BASE_URL
+        value: https://rhome.simprosuite.com
+      - key: SIMPRO_CLIENT_ID
+        sync: false   # fill in on Render
+      - key: SIMPRO_CLIENT_SECRET
+        sync: false   # fill in on Render
+      - key: SIMPRO_COMPANY_ID
+        sync: false   # optional
+      - key: SLACK_WEBHOOK_URL
+        sync: false   # optional
+      - key: TZ
+        value: America/Chicago
+
+cronJobs:
+  - name: eod-live-ingest
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.ingest --mode live
+    schedule: "0 22 * * *"   # 5:00 pm Chicago during daylight time
+    envVars:
+      - key: SIMPRO_BASE_URL
+        value: https://rhome.simprosuite.com
+      - key: SIMPRO_CLIENT_ID
+        sync: false
+      - key: SIMPRO_CLIENT_SECRET
+        sync: false
+      - key: SIMPRO_COMPANY_ID
+        sync: false
+      - key: TZ
+        value: America/Chicago
