@@ -25,22 +25,17 @@ services:
         sync: false   # optional
       - key: TZ
         value: America/Chicago
-
 cronJobs:
   - name: eod-live-ingest
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -m app.ingest --mode live
-    schedule: "0 22 * * *"   # 5:00 pm Chicago during daylight time
+    buildCommand: echo "no build needed"
+    # Call the web app's endpoint so the DB updates on the web service's disk
+    startCommand: bash -lc 'curl -fsS -X POST "$DASHBOARD_URL/ingest/live" || exit 1'
+    schedule: "0 22 * * *"   # 5:00 pm Chicago during Daylight Time (CDT)
     envVars:
-      - key: SIMPRO_BASE_URL
-        value: https://rhome.simprosuite.com
-      - key: SIMPRO_CLIENT_ID
-        sync: false
-      - key: SIMPRO_CLIENT_SECRET
-        sync: false
-      - key: SIMPRO_COMPANY_ID
-        sync: false
-      - key: TZ
-        value: America/Chicago
+      - key: DASHBOARD_URL
+        fromService:
+          name: rhome-eod-dashboard
+          type: web
+          property: url
