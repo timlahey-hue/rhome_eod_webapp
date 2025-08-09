@@ -3,7 +3,7 @@ services:
   - type: web
     name: rhome-eod-dashboard
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: bash -lc 'ln -sf /data/eod.db ./eod.db; uvicorn app.main:app --host 0.0.0.0 --port $PORT'
     healthCheckPath: /health
@@ -25,13 +25,13 @@ services:
       - key: TZ
         value: America/Chicago
 
-  # Cron job defined as a service (correct way)
   - type: cron
     name: eod-live-ingest
     runtime: python
-    schedule: "0 22 * * *"  # 5:00 pm Chicago during Daylight Time (use 23:00 in CST if you want year-round 5pm)
+    plan: starter
+    schedule: "0 22 * * *"  # 5:00 pm Chicago during Daylight Time
     buildCommand: "true"
-    # Call the web app so the ingest runs where the disk is mounted
+    # Run ingest INSIDE the web service so it writes to the attached disk
     startCommand: bash -lc 'curl -fsS -X POST "http://$DASHBOARD_HOSTPORT/ingest/live" || exit 1'
     envVars:
       - key: DASHBOARD_HOSTPORT
