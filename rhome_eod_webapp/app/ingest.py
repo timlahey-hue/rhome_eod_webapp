@@ -1,214 +1,229 @@
-# rhome_eod_webapp/app/ingest.py
-from __future__ import annotations
+# app/ingest.py
+import os, re, time, math, sqlite3, logging, datetime as dt
+from typing import Any, Dict, Optional
+from . import simpro
 
-import logging
-import time
-from typing import Any, Dict, List, Optional
+log = logging.getLogger("ingest")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
-import requests
+DB_PATH = os.path.join(os.path.dirname(__file__), "eod.db")
 
-# We keep simpro import optional so the app won't crash
-try:
-    from . import simpro  # type: ignore
-except Exception:  # pragma: no cover
-    simpro = None  # type: ignore
+def _get(d: Dict[str, Any], *path, default=None):
+    cur = d
+    for p in path:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return default
+    return cur
 
-logger = logging.getLogger("ingest")
-if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+def _f(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+def _parse_iso(dt_str: Optional[str]) -> Optional[dt.datetime]:
+    if not dt_str:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(dt_str, fmt)
+        except Exception:
+            continue
+    return None
+
+def _ensure_schema(con: sqlite3.Connection):
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+          id INTEGER PRIMARY KEY,
+          snapshot_date TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS job_rows (
+          id INTEGER PRIMARY KEY,
+          snapshot_id INTEGER NOT NULL,
+          job_code TEXT,
+          job_name TEXT,
+          pm TEXT,
+          hours_today REAL,
+          labour_cost_today REAL,
+          materials_cost_today REAL,
+          cost_today REAL,
+          actual_cost_to_date REAL,
+          estimated_cost REAL,
+          burn_pct REAL,
+          gm_to_date REAL,
+          invoiced_today REAL,
+          mtd_hours REAL,
+          days_since_update INTEGER,
+          at_risk INTEGER
+        )
+    """)
+    # Compatibility views the UI expects
+    cur.execute("CREATE VIEW IF NOT EXISTS snapshot AS SELECT id, snapshot_date AS as_of, created_at FROM snapshots")
+    cur.execute("CREATE VIEW IF NOT EXISTS job AS SELECT * FROM job_rows")
+    con.commit()
+
+def _max_seen_job_id(con: sqlite3.Connection) -> int:
+    cur = con.cursor()
+    cur.execute("SELECT MAX(CASE WHEN job_code GLOB '[0-9]*' THEN CAST(job_code AS INTEGER) ELSE NULL END) FROM job_rows")
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+def _insert_snapshot(con: sqlite3.Connection) -> int:
+    now = dt.datetime.utcnow()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO snapshots (snapshot_date, created_at) VALUES (?, ?)",
+        (now.date().isoformat(), now.replace(microsecond=0).isoformat()+"Z"),
+    )
+    con.commit()
+    return cur.lastrowid
+
+def _status_ok(job: Dict[str, Any], rx: re.Pattern) -> bool:
+    status = _get(job, "Status", "Name") or _get(job, "Stage", "Name") or ""
+    return bool(rx.search(status))
+
+def _row_from_job(job: Dict[str, Any], snapshot_id: int) -> Dict[str, Any]:
+    # Safe fallbacks based on examples you shared
+    # Names
+    job_id = _get(job, "ID")
+    job_code = str(job_id) if job_id is not None else (_get(job, "JobNo") or "")
+    job_name = (_get(job, "Customer", "CompanyName")
+                or _get(job, "Site", "Name")
+                or _get(job, "Description")
+                or f"Job {job_code}")
+
+    # Costs & margins (best-effort: field names differ a bit across tenants)
+    ex_tax = _f(_get(job, "Total", "ExTax") or _get(job, "Totals", "Estimate", "ExTax"))
+    actual = _f(_get(job, "Totals", "Actual", "ExTax") or _get(job, "Total", "Actual") or _get(job, "Total", "Cost"))
+    estimated = ex_tax if ex_tax > 0 else _f(_get(job, "Totals", "Estimate", "IncTax"))
+
+    burn_pct = (actual / estimated) if estimated > 0 else None
+    gm_to_date = ((estimated - actual) / estimated) if estimated > 0 else None
+
+    # “today” fields require separate timesheet/material endpoints.
+    # Until we wire those up, keep 0 so the tiles don’t error.
+    hours_today = 0.0
+    labour_today = 0.0
+    materials_today = 0.0
+    cost_today = 0.0
+    invoiced_today = 0.0
+    mtd_hours = 0.0
+
+    updated = _parse_iso(_get(job, "UpdatedOn") or _get(job, "LastUpdated"))
+    days_since_update = None
+    if updated:
+        days_since_update = max(0, (dt.datetime.utcnow().replace(tzinfo=None) - updated.replace(tzinfo=None)).days)
+
+    at_risk = 1 if (gm_to_date is not None and gm_to_date < 0) or (burn_pct is not None and burn_pct > 1.05) else 0
+
+    return dict(
+        snapshot_id=snapshot_id,
+        job_code=job_code,
+        job_name=job_name,
+        pm=None,
+        hours_today=hours_today,
+        labour_cost_today=labour_today,
+        materials_cost_today=materials_today,
+        cost_today=cost_today,
+        actual_cost_to_date=actual,
+        estimated_cost=estimated,
+        burn_pct=burn_pct if burn_pct is not None else None,
+        gm_to_date=gm_to_date if gm_to_date is not None else None,
+        invoiced_today=invoiced_today,
+        mtd_hours=mtd_hours,
+        days_since_update=days_since_update,
+        at_risk=at_risk,
     )
 
-
-class IngestError(RuntimeError):
-    """Non-fatal ingest error we capture and report without crashing the app."""
-
-
-def _get_token(base_url: str, client_id: str, client_secret: str) -> str:
+def ingest_live(base_url: str, client_id: str, client_secret: str, company_id: Optional[int] = None):
     """
-    Get an OAuth token using simpro.get_token if available.
-    Raises IngestError on failure.
-    """
-    if not base_url or not client_id or not client_secret:
-        raise IngestError("Missing Simpro credentials (base URL, client id, or client secret).")
-
-    if simpro and hasattr(simpro, "get_token"):
-        try:
-            token = simpro.get_token(base_url, client_id, client_secret)  # type: ignore[attr-defined]
-            if not token:
-                raise IngestError("simpro.get_token returned no token.")
-            return token
-        except Exception as e:  # noqa: BLE001
-            raise IngestError(f"Authentication failed: {e}") from e
-
-    # If the project doesn't expose simpro.get_token we fail loudly but cleanly.
-    raise IngestError("simpro.get_token not found; cannot authenticate.")
-
-
-def _try_http_get(urls: List[str], headers: Dict[str, str], timeout: int = 30) -> Optional[requests.Response]:
-    """
-    Try a list of URLs in order; return the first successful (200) response.
-    """
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            logger.debug("GET %s -> %s", url, r.status_code)
-        except requests.RequestException as e:  # network or TLS problems
-            logger.debug("GET %s failed: %s", url, e)
-    return None
-
-
-def _safe_list_companies(base_url: str, token: str, timeout: int = 30) -> List[Dict[str, Any]]:
-    """
-    Try multiple plausible Companies endpoints. Return [] if none work.
-    Never raises; always returns a list (possibly empty).
-    """
-    # First prefer the project's own function (keeps code DRY if it's correct)
-    if simpro and hasattr(simpro, "list_companies"):
-        try:
-            companies = simpro.list_companies(base_url, token)  # type: ignore[attr-defined]
-            if isinstance(companies, list):
-                return companies
-            # Some APIs return an object with a 'data' or 'items' field
-            if isinstance(companies, dict):
-                for key in ("data", "items", "results"):
-                    if key in companies and isinstance(companies[key], list):
-                        return companies[key]  # type: ignore[return-value]
-        except requests.HTTPError as e:
-            # Log details but don't crash ingestion
-            status = getattr(e.response, "status_code", "?")
-            logger.warning("list_companies HTTP %s; will try fallbacks", status)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("list_companies failed (%s); will try fallbacks", e)
-
-    # Fallbacks with common case/casing variations
-    headers = {"Authorization": f"Bearer {token}"}
-    candidates = [
-        f"{base_url}/api/v1.0/companies",
-        f"{base_url}/api/v1.0/Companies",
-        f"{base_url}/api/v1.0/company",
-        f"{base_url}/api/v1.0/Company",
-    ]
-    r = _try_http_get(candidates, headers=headers, timeout=timeout)
-    if not r:
-        return []
-
-    try:
-        data = r.json()
-    except ValueError:
-        return []
-
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("data", "items", "results"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
-    return []
-
-
-def _extract_company_id(obj: Dict[str, Any]) -> Optional[str]:
-    """Pull a company id from a variety of possible shapes."""
-    for k in ("companyId", "companyID", "id", "Id", "ID"):
-        if k in obj and obj[k] is not None:
-            return str(obj[k])
-    return None
-
-
-def ingest_live(
-    base_url: str,
-    client_id: str,
-    client_secret: str,
-    company_id: Optional[str | int] = None,
-    *,
-    timeout: int = 30,
-) -> Dict[str, Any]:
-    """
-    Live ingestion orchestrator.
-
-    IMPORTANT:
-    • Never raises — returns a summary dict your route can ignore or log.
-    • Handles 404s from the Companies endpoint by falling back to the provided SIMPRO_COMPANY_ID.
+    Scans job IDs forward from the largest one we've already stored,
+    stops after a run of 404s, filters by status ("Pending" or "In Progress"),
+    and writes rows into snapshots/job_rows for the latest snapshot.
     """
     t0 = time.time()
-    summary: Dict[str, Any] = {
-        "ok": False,
-        "error": None,
-        "company_id": str(company_id) if company_id is not None else None,
-        "company_name": None,
-        "companies_seen": 0,
-        "elapsed_s": None,
-    }
 
-    try:
-        token = _get_token(base_url, client_id, client_secret)
-        logger.info("Authenticated with Simpro")
+    # ---- config via env (all optional except company id) ----
+    company_id = int(company_id if company_id is not None else os.environ.get("SIMPRO_COMPANY_ID", "0"))
+    allowed_status_rx = re.compile(os.environ.get("SIMPRO_ALLOWED_STATUS", r"(?i)\b(pending|in progress|progress)\b"))
+    scan_ahead = int(os.environ.get("SIMPRO_SCAN_AHEAD", "800"))           # how many IDs to try past last seen
+    stop_after_misses = int(os.environ.get("SIMPRO_STOP_AFTER_MISSES", "200"))  # consecutive 404s before early-stop
+    seed_start = os.environ.get("SIMPRO_SEED_START_ID")                    # optional first-run speed-up
 
-        companies: List[Dict[str, Any]] = []
+    # ---- auth & client ----
+    token = simpro.get_token(base_url, client_id, client_secret)
+    log.info("Authenticated with Simpro")
+    client = simpro.Client(base_url, token)
+
+    # ---- db + snapshot ----
+    con = sqlite3.connect(DB_PATH)
+    _ensure_schema(con)
+    snap_id = _insert_snapshot(con)
+
+    cur = con.cursor()
+    # Figure out where to start scanning
+    last_seen = _max_seen_job_id(con)
+    start_id = last_seen + 1 if last_seen > 0 else (int(seed_start) if seed_start else 1)
+    end_id = start_id + scan_ahead - 1
+
+    found = 0
+    kept = 0
+    misses = 0
+
+    # Try ascending job IDs with early stop on long 404 runs
+    for job_id in range(start_id, end_id + 1):
         try:
-            companies = _safe_list_companies(base_url, token, timeout=timeout)
-        except Exception as e:  # extra safety; we *never* want to bubble exceptions
-            logger.warning("Listing companies failed unexpectedly: %s", e)
-            companies = []
+            j = client.get_job(company_id, job_id)
+        except Exception as e:
+            # non-404 errors: log & keep going (transient or permission issues)
+            log.warning("job %s: error %s", job_id, e)
+            continue
 
-        summary["companies_seen"] = len(companies)
+        if j is None:
+            misses += 1
+            if misses >= stop_after_misses:
+                log.info("Stopping scan at %s after %s consecutive 404s", job_id, misses)
+                break
+            continue
 
-        # If a company_id was not given, try to pick one
-        chosen_id: Optional[str] = str(company_id) if company_id is not None else None
-        chosen_name: Optional[str] = None
+        # reset miss streak on a hit
+        misses = 0
+        found += 1
 
-        if not chosen_id and companies:
-            first = companies[0]
-            chosen_id = _extract_company_id(first)
-            chosen_name = first.get("name") or first.get("companyName") or first.get("Name")
+        # Filter by status
+        if not _status_ok(j, allowed_status_rx):
+            continue
 
-        if not chosen_id:
-            # We couldn't resolve a company id at all; log and finish cleanly.
-            raise IngestError(
-                "Could not determine company id. "
-                "Set SIMPRO_COMPANY_ID in Render → Environment (or pass it to ingest_live)."
-            )
+        kept += 1
+        row = _row_from_job(j, snap_id)
+        cur.execute("""
+            INSERT INTO job_rows (
+              snapshot_id, job_code, job_name, pm,
+              hours_today, labour_cost_today, materials_cost_today, cost_today,
+              actual_cost_to_date, estimated_cost, burn_pct, gm_to_date,
+              invoiced_today, mtd_hours, days_since_update, at_risk
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            row["snapshot_id"], row["job_code"], row["job_name"], row["pm"],
+            row["hours_today"], row["labour_cost_today"], row["materials_cost_today"], row["cost_today"],
+            row["actual_cost_to_date"], row["estimated_cost"], row["burn_pct"], row["gm_to_date"],
+            row["invoiced_today"], row["mtd_hours"], row["days_since_update"], row["at_risk"],
+        ))
 
-        # At this point we have a token and a company id.
-        # This is where you would call additional simpro.* helpers to fetch and persist data.
-        # We keep this lightweight to avoid coupling to unknown functions/tables.
-        # Example (pseudo):
-        # jobs = simpro.list_jobs(base_url, token, chosen_id)
-        # save_to_db(jobs, ...)
+    con.commit()
+    con.close()
 
-        summary["company_id"] = chosen_id
-        summary["company_name"] = chosen_name
-        summary["ok"] = True
-        return summary
-
-    except IngestError as e:
-        summary["error"] = str(e)
-        logger.error("%s", e)
-        return summary
-
-    except Exception as e:  # noqa: BLE001
-        # Absolute last-resort safety: report as non-fatal so the route returns 200/303.
-        summary["error"] = f"Unhandled error: {e}"
-        logger.exception("Unhandled ingest_live error")
-        return summary
-
-    finally:
-        summary["elapsed_s"] = round(time.time() - t0, 3)
-        logger.info("ingest_live finished in %.3fs (ok=%s)", summary["elapsed_s"], summary["ok"])
-
-
-def ingest_demo() -> Dict[str, Any]:
-    """
-    Keep a simple demo ingest so /ingest/demo continues to succeed.
-    (Your existing route likely just redirects after this returns.)
-    """
-    now = time.time()
-    return {
-        "ok": True,
-        "demo": True,
-        "timestamp": now,
-        "message": "Demo ingest complete",
-    }
+    dt_s = time.time() - t0
+    ok = kept >= 0  # always true; we didn’t crash
+    log.info("ingest_live finished in %.3fs (hits=%s, active=%s, ok=%s)", dt_s, found, kept, ok)
+    return {"ok": ok, "hits": found, "active_kept": kept, "snapshot_id": snap_id}
