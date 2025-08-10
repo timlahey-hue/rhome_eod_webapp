@@ -13,6 +13,9 @@ from .slack import share_summary
 load_dotenv()
 
 app = FastAPI(title="r:home EOD Dashboard")
+@app.get("/health")
+def health():
+    return {"ok": True}
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
