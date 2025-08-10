@@ -462,3 +462,22 @@ def ingest_demo() -> Tuple[bool, str]:
     finally:
         con.close()
     return True, f"demo snapshot={sid}, jobs={len(demo_jobs)}"
+# --- Back-compat shim for app.main imports (leave at end of file) ---
+# If ingest_live was defined with no parameters, wrap it so it accepts positional args.
+try:
+    import inspect as _inspect  # type: ignore
+    if "ingest_live" in globals():
+        _sig = str(_inspect.signature(ingest_live))
+        if _sig == "()":
+            _ingest_live_noargs = ingest_live  # keep original
+            def ingest_live(*_args, **_kwargs):  # type: ignore[override]
+                return _ingest_live_noargs()
+except Exception:
+    # Never block app startup on shim logic
+    pass
+
+# Some copies of app.main still import `ingest`; keep it as an alias to `ingest_live`.
+def ingest(*args, **kwargs):  # type: ignore[override]
+    return ingest_live(*args, **kwargs)
+# --- end shim ---
+
