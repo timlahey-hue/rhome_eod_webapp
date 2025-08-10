@@ -4,7 +4,10 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: bash -lc 'ln -sf /data/eod.db ./eod.db; uvicorn app.main:app --host 0.0.0.0 --port $PORT'
+    startCommand: >
+  bash -lc 'cd rhome_eod_webapp;
+  ln -sf /data/eod.db ./eod.db;
+  python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT'
     healthCheckPath: /
     disk:
       name: eod-snapshots
