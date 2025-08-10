@@ -1,11 +1,11 @@
-# Render Blueprint: r:home EOD Web Dashboard
 services:
   - type: web
     name: rhome-eod-dashboard
-    runtime: python
+    env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: bash -lc 'ln -sf /data/eod.db ./eod.db; uvicorn app.main:app --host 0.0.0.0 --port $PORT'
+    startCommand: >
+      bash -lc 'ln -sf /data/eod.db ./eod.db; uvicorn app.main:app --host 0.0.0.0 --port $PORT'
     healthCheckPath: /health
     disk:
       name: eod-snapshots
@@ -27,12 +27,12 @@ services:
 
   - type: cron
     name: eod-live-ingest
-    runtime: python
+    env: python
     plan: starter
-    schedule: "0 22 * * *"  # 5:00 pm Chicago during Daylight Time
+    schedule: "0 22 * * *"  # ~5:00pm Chicago during daylight time
     buildCommand: "true"
-    # Run ingest INSIDE the web service so it writes to the attached disk
-    startCommand: bash -lc 'curl -fsS -X POST "http://$DASHBOARD_HOSTPORT/ingest/live" || exit 1'
+    startCommand: >
+      bash -lc 'curl -fsS -X POST "http://$DASHBOARD_HOSTPORT/ingest/live" || exit 1'
     envVars:
       - key: DASHBOARD_HOSTPORT
         fromService:
