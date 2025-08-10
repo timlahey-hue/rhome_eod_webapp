@@ -1,0 +1,9 @@
+[Unit]
+Description=r:home Web EOD Dashboard (ingest)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/rhome_eod_webapp
+EnvironmentFile=/etc/rhome_eod_webapp.env
+ExecStart=/usr/bin/python3 -m app.ingest --mode live

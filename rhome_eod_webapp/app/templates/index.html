@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="section">
+  <div class="h1">End of Day Dashboard</div>
+  <div class="subtle">Shows the latest saved snapshot. Use the buttons below to run a demo or live ingest.</div>
+
+  <div class="actions">
+    <form method="post" action="/ingest/demo"><button>Run Demo Ingest</button></form>
+    <form method="post" action="/ingest/live"><button class="secondary">Run Live Ingest</button></form>
+    {% if snapshot %}
+      <form method="post" action="/share/{{ snapshot['id'] }}">
+        <button class="ghost" {% if not env_ok.SLACK_WEBHOOK_URL %}disabled title="Set SLACK_WEBHOOK_URL in .env"{% endif %}>Share to Slack</button>
+      </form>
+    {% endif %}
+  </div>
+
+  <div class="kpis">
+    <div class="card">
+      <div class="label">Snapshot</div>
+      <div class="value">{% if snapshot %}{{ snapshot['snapshot_date'] }} (id {{ snapshot['id'] }}){% else %}None yet{% endif %}</div>
+    </div>
+    <div class="card"><div class="label">Hours Today</div><div class="value">{{ '%.1f'|format(totals.get('hours_today',0)) }}</div></div>
+    <div class="card"><div class="label">Labour $ Today</div><div class="value">{{ fmt_currency(totals.get('labour_cost_today',0)) }}</div></div>
+    <div class="card"><div class="label">Materials $ Today</div><div class="value">{{ fmt_currency(totals.get('materials_cost_today',0)) }}</div></div>
+    <div class="card"><div class="label">Invoiced $ Today</div><div class="value">{{ fmt_currency(totals.get('invoiced_today',0)) }}</div></div>
+    <div class="card"><div class="label">MTD GM%</div><div class="value">{{ fmt_pct(totals.get('mtd_gm_pct')) }}</div></div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <div class="label">Top 5 — Cost Added Today</div>
+      {% if top5 %}
+        <ul class="list">
+        {% for r in top5 %}
+          <li><strong>{{ r['job_name'] }}</strong><span>{{ fmt_currency((r.get('labour_cost_today',0)+r.get('materials_cost_today',0))) }}</span></li>
+        {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">No data yet.</p>
+      {% endif %}
+    </div>
+    <div class="card">
+      <div class="label">At-Risk (burn ≥ 80% or GM% &lt; 20%)</div>
+      {% if at_risk %}
+        <ul class="list">
+        {% for r in at_risk %}
+          <li><strong>{{ r['job_name'] }}</strong><span>Burn {{ fmt_pct(r.get('burn_pct')) }}</span></li>
+        {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">None 🎉</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card table">
+    <h2>Jobs — Costing Snapshot</h2>
+    {% if rows %}
+    <table>
+      <thead>
+        <tr>
+          <th>Job</th><th>PM</th><th>Hours Today</th><th>Labour $</th><th>Materials $</th><th>Δ Cost Today</th>
+          <th>Actual Cost To‑Date</th><th>Est. Cost</th><th>Burn %</th><th>GM% To‑Date</th><th>Idle Days</th><th>At‑Risk</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['job_name'] }}</td>
+          <td>{{ r['pm'] }}</td>
+          <td class="num">{{ '%.1f'|format(r['hours_today'] or 0) }}</td>
+          <td class="num">{{ fmt_currency(r['labour_cost_today']) }}</td>
+          <td class="num">{{ fmt_currency(r['materials_cost_today']) }}</td>
+          <td class="num">{{ fmt_currency((r['labour_cost_today'] or 0)+(r['materials_cost_today'] or 0)) }}</td>
+          <td class="num">{{ fmt_currency(r['actual_cost_to_date']) }}</td>
+          <td class="num">{{ fmt_currency(r['estimated_cost']) }}</td>
+          <td class="num">{{ fmt_pct(r['burn_pct']) }}</td>
+          <td class="num">{{ fmt_pct(r['gm_to_date']) }}</td>
+          <td class="num">{{ r['days_since_update'] or 0 }}</td>
+          <td class="num">{% if r['at_risk'] %}⚠️{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">No snapshot yet. Run a Demo Ingest to see the layout.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>History</h2>
+    {% if snapshot %}
+      <ul class="list">
+        {% for s in [] %}{% endfor %}
+        <li><a href="/snapshots/{{ snapshot['id'] }}">View snapshot {{ snapshot['snapshot_date'] }} (id {{ snapshot['id'] }})</a></li>
+      </ul>
+    {% else %}
+      <p class="muted">No saved snapshots yet.</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

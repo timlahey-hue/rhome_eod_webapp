@@ -1,0 +1,10 @@
+[Unit]
+Description=r:home Web EOD Dashboard timer (5pm America/Chicago)
+
+[Timer]
+OnCalendar=*-*-* 23:00:00 UTC
+Persistent=true
+Unit=rhome_eod_webapp_ingest.service
+
+[Install]
+WantedBy=timers.target

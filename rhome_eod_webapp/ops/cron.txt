@@ -1,0 +1,5 @@
+# Run live ingest at 5:00 pm America/Chicago daily
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+TZ=America/Chicago
+0 17 * * * cd /opt/rhome_eod_webapp && /usr/bin/python3 -m app.ingest --mode live >> /var/log/rhome_eod_webapp.log 2>&1

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="section">
+  <div class="h1">Snapshot — {{ snapshot['snapshot_date'] }} (id {{ snapshot['id'] }})</div>
+  <div class="actions">
+    <a class="ghost" href="/">← Back</a>
+  </div>
+
+  <div class="kpis">
+    <div class="card"><div class="label">Hours Today</div><div class="value">{{ '%.1f'|format(totals.get('hours_today',0)) }}</div></div>
+    <div class="card"><div class="label">Labour $ Today</div><div class="value">{{ fmt_currency(totals.get('labour_cost_today',0)) }}</div></div>
+    <div class="card"><div class="label">Materials $ Today</div><div class="value">{{ fmt_currency(totals.get('materials_cost_today',0)) }}</div></div>
+    <div class="card"><div class="label">Invoiced $ Today</div><div class="value">{{ fmt_currency(totals.get('invoiced_today',0)) }}</div></div>
+    <div class="card"><div class="label">MTD GM%</div><div class="value">{{ fmt_pct(totals.get('mtd_gm_pct')) }}</div></div>
+  </div>
+
+  <div class="card table">
+    <h2>Jobs — Costing Snapshot</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Job</th><th>PM</th><th>Hours Today</th><th>Labour $</th><th>Materials $</th><th>Δ Cost Today</th>
+          <th>Actual Cost To‑Date</th><th>Est. Cost</th><th>Burn %</th><th>GM% To‑Date</th><th>Idle Days</th><th>At‑Risk</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['job_name'] }}</td>
+          <td>{{ r['pm'] }}</td>
+          <td class="num">{{ '%.1f'|format(r['hours_today'] or 0) }}</td>
+          <td class="num">{{ fmt_currency(r['labour_cost_today']) }}</td>
+          <td class="num">{{ fmt_currency(r['materials_cost_today']) }}</td>
+          <td class="num">{{ fmt_currency((r['labour_cost_today'] or 0)+(r['materials_cost_today'] or 0)) }}</td>
+          <td class="num">{{ fmt_currency(r['actual_cost_to_date']) }}</td>
+          <td class="num">{{ fmt_currency(r['estimated_cost']) }}</td>
+          <td class="num">{{ fmt_pct(r['burn_pct']) }}</td>
+          <td class="num">{{ fmt_pct(r['gm_to_date']) }}</td>
+          <td class="num">{{ r['days_since_update'] or 0 }}</td>
+          <td class="num">{% if r['at_risk'] %}⚠️{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

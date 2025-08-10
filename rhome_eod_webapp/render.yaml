@@ -1,0 +1,47 @@
+# Render Blueprint: r:home EOD Web Dashboard
+# Deploy both the web dashboard and a daily 5pm CT ingest (22:00 UTC during DST)
+services:
+  - type: web
+    name: rhome-eod-dashboard
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash -lc 'ln -sf /data/eod.db ./eod.db; uvicorn app.main:app --host 0.0.0.0 --port $PORT'
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: eod-snapshots
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: SIMPRO_BASE_URL
+        value: https://rhome.simprosuite.com
+      - key: SIMPRO_CLIENT_ID
+        sync: false   # set this in the Render dashboard
+      - key: SIMPRO_CLIENT_SECRET
+        sync: false   # set this in the Render dashboard
+      - key: SIMPRO_COMPANY_ID
+        sync: false   # optional
+      - key: SLACK_WEBHOOK_URL
+        sync: false   # optional; only for "Share to Slack" button
+      - key: TZ
+        value: America/Chicago
+
+cronJobs:
+  - name: eod-live-ingest
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.ingest --mode live
+    schedule: "0 22 * * *"   # 5:00 pm America/Chicago during daylight time (CDT = UTC-5)
+    envVars:
+      - key: SIMPRO_BASE_URL
+        value: https://rhome.simprosuite.com
+      - key: SIMPRO_CLIENT_ID
+        sync: false
+      - key: SIMPRO_CLIENT_SECRET
+        sync: false
+      - key: SIMPRO_COMPANY_ID
+        sync: false
+      - key: TZ
+        value: America/Chicago
