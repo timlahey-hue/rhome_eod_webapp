@@ -80,7 +80,7 @@ def ingest_live(base_url, client_id, client_secret, company_id=None):
   snap_id = db.create_snapshot(today)
 
   token = get_access_token(base_url, client_id, client_secret)
-  companies = list_companies(base_url, token)
+
   if not companies:
     raise RuntimeError("No companies returned")
   if not company_id:
