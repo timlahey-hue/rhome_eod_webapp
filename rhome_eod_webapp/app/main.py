@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 from . import db
 from .metrics import compute_metrics
-from .ingest import ingest_demo, ingest_live
+from .ingest import ingest, ingest_live
 from .slack import share_summary
 
 load_dotenv()
@@ -71,7 +71,7 @@ def run_live_ingest():
   co  = os.getenv("SIMPRO_COMPANY_ID") or None
   if not all([base, cid, sec]):
     return RedirectResponse(url="/?error=missing_creds", status_code=303)
-  data = ingest_live(base, cid, sec, co)
+  data = ingest_live()
   return RedirectResponse(url="/", status_code=303)
 
 @app.post("/share/{snapshot_id}")
