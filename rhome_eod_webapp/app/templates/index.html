@@ -1,51 +1,29 @@
 {% extends "base.html" %}
 {% block content %}
-
-{% set safe = totals or {} %}
-
-{% if not safe or safe|length == 0 %}
-  <p class="sub err">Heads up: no totals found in the database yet. The page still renders, but values are zeroed.</p>
-{% endif %}
-
-<div class="cards">
-  <div class="card">
-    <div class="label">Labour $ Today</div>
-    <div class="value">{{ fmt_currency(safe.get('labour_cost_today', 0)) }}</div>
-    <div class="sub">from Simpro / eod.db</div>
+  <div class="row">
+    <form action="/ingest/live" method="post">
+      <button type="submit">Run Live Ingest</button>
+    </form>
+    <a class="btn" href="/ingest/ping">Ping Simpro</a>
+    <div class="muted">Now: <span class="mono">{{ now }}</span></div>
   </div>
 
-  <div class="card">
-    <div class="label">MTD GM%</div>
-    <div class="value">{{ fmt_pct(safe.get('mtd_gm_pct', 0)) }}</div>
-    <div class="sub">gross margin month-to-date</div>
+  <div class="grid">
+    <div class="card"><div class="label">Revenue Today</div><div class="value">{{ fmt_currency(totals.get('revenue_today', 0)) }}</div></div>
+    <div class="card"><div class="label">Revenue MTD</div><div class="value">{{ fmt_currency(totals.get('revenue_mtd', 0)) }}</div></div>
+
+    <div class="card"><div class="label">Materials $ Today</div><div class="value">{{ fmt_currency(totals.get('materials_cost_today', 0)) }}</div></div>
+    <div class="card"><div class="label">Materials $ MTD</div><div class="value">{{ fmt_currency(totals.get('materials_cost_mtd', 0)) }}</div></div>
+
+    <div class="card"><div class="label">Labour $ Today</div><div class="value">{{ fmt_currency(totals.get('labour_cost_today', 0)) }}</div></div>
+    <div class="card"><div class="label">Labour $ MTD</div><div class="value">{{ fmt_currency(totals.get('labour_cost_mtd', 0)) }}</div></div>
+
+    <div class="card"><div class="label">MTD GM%</div><div class="value">{{ fmt_pct(totals.get('mtd_gm_pct', 0)) }}</div></div>
+
+    <div class="card">
+      <div class="label">Ingest</div>
+      <div class="value">{{ fmt_int(totals.get('jobs_ingested', 0)) }} jobs</div>
+      <div class="muted">Last run: {{ hms(totals.get('last_ingest_ts')) }}</div>
+    </div>
   </div>
-
-  <div class="card">
-    <div class="label">MTD Revenue</div>
-    <div class="value">{{ fmt_currency(safe.get('mtd_revenue', 0)) }}</div>
-  </div>
-
-  <div class="card">
-    <div class="label">MTD Labour</div>
-    <div class="value">{{ fmt_currency(safe.get('mtd_labour', 0)) }}</div>
-  </div>
-
-  <div class="card">
-    <div class="label">MTD Materials</div>
-    <div class="value">{{ fmt_currency(safe.get('mtd_materials', 0)) }}</div>
-  </div>
-
-  <div class="card">
-    <div class="label">MTD Other</div>
-    <div class="value">{{ fmt_currency(safe.get('mtd_other', 0)) }}</div>
-  </div>
-</div>
-
-<div style="margin-top:18px;">
-  <form method="post" action="/ingest/live" onsubmit="this.querySelector('button').disabled = true;">
-    <button type="submit">Run Live Ingest Probe</button>
-    <span class="sub">returns JSON with auth & endpoint discovery</span>
-  </form>
-</div>
-
 {% endblock %}
