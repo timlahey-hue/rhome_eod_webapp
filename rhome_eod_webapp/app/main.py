@@ -1,175 +1,119 @@
 import os
 import sqlite3
 import logging
-from typing import Any, Dict, Tuple, Union
+from datetime import datetime
+from typing import Dict, Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-# ---------------------------------
-# Logging
-# ---------------------------------
-logging.basicConfig(level=logging.INFO)
+# -------- logging --------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("app")
 
-# ---------------------------------
-# App & Templates
-# ---------------------------------
+# -------- FastAPI / Jinja setup --------
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
-
 templates = Jinja2Templates(directory="app/templates")
 
-# ---------------------------------
-# Jinja helpers (currency & percent)
-# ---------------------------------
-def fmt_currency(value: Any) -> str:
+def fmt_currency(x):
     try:
-        v = float(value or 0)
-        # No decimals for dollars; change to :.2f if you want cents
-        return f"${v:,.0f}"
-    except (TypeError, ValueError):
+        if x is None:
+            return "$0"
+        return f"${float(x):,.0f}"
+    except Exception:
         return "$0"
 
-def fmt_pct(value: Any) -> str:
+def fmt_pct(x):
     try:
-        v = float(value)
-        # Accepts 0.1234 or 12.34; if value <= 1 we assume it's a ratio
-        if abs(v) <= 1:
-            v *= 100.0
-        return f"{v:.1f}%"
-    except (TypeError, ValueError):
-        return "0.0%"
-
-# Register as both filters and globals (so Jinja can call them either way)
-templates.env.filters["fmt_currency"] = fmt_currency
-templates.env.filters["fmt_pct"] = fmt_pct
-templates.env.globals.update(fmt_currency=fmt_currency, fmt_pct=fmt_pct)
-
-# ---------------------------------
-# DB helpers (very defensive)
-# ---------------------------------
-DB_PATH = os.getenv("EOD_DB_PATH", "eod.db")
-
-def _connect_db():
-    if not os.path.exists(DB_PATH):
-        return None
-    try:
-        return sqlite3.connect(DB_PATH)
+        if x is None:
+            return "0%"
+        return f"{float(x) * 100:.1f}%"
     except Exception:
-        log.exception("Failed to open DB at %s", DB_PATH)
-        return None
+        return "0%"
+
+def fmt_int(x):
+    try:
+        if x is None:
+            return "0"
+        return f"{int(round(float(x))):,}"
+    except Exception:
+        return "0"
+
+# Make helpers available as globals in Jinja (so {{ fmt_currency(...) }} works)
+templates.env.globals.update(
+    fmt_currency=fmt_currency,
+    fmt_pct=fmt_pct,
+    fmt_int=fmt_int,
+)
+
+DB_PATH = os.environ.get("EOD_DB_PATH", "eod.db")
+
+def _get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,)
+    )
+    return cur.fetchone() is not None
 
 def get_totals() -> Dict[str, Any]:
-    """
-    Return a dict of totals used by the dashboard.
-    This is deliberately defensive: if the DB or rows aren't there,
-    we just return an empty dict so templates can .get() safely.
-    """
-    conn = _connect_db()
-    if not conn:
-        return {}
+    """Return the latest row from the `totals` table, or {} if the table is missing/empty."""
     try:
-        cur = conn.cursor()
-        # Adapt this query to your schema as needed. If you already had a working query, keep it.
-        # Here we try to read a single-row 'totals' view/table if it exists.
-        cur.execute("""
-            SELECT
-                COALESCE(hours_today, 0),
-                COALESCE(labour_cost_today, 0),
-                COALESCE(material_cost_today, 0),
-                COALESCE(revenue_today, 0),
-                COALESCE(mtd_gm_pct, 0)
-            FROM totals
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        if not row:
-            return {}
-        return {
-            "hours_today": row[0],
-            "labour_cost_today": row[1],
-            "material_cost_today": row[2],
-            "revenue_today": row[3],
-            "mtd_gm_pct": row[4],
-        }
+        conn = _get_conn()
+        with conn:
+            if not _table_exists(conn, "totals"):
+                log.error("get_totals(): 'totals' table not found; returning empty dict")
+                return {}
+            row = conn.execute(
+                "SELECT * FROM totals ORDER BY COALESCE(updated_at, '') DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else {}
     except Exception:
-        # If the table/view doesn't exist or anything else is wrong, don't blow up the page
         log.exception("get_totals() failed; returning empty totals")
         return {}
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
-# ---------------------------------
-# Routes
-# ---------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def home(request: Request):
-    totals = get_totals()  # empty dict if DB missing
-    # Always pass fmt_* too (belt & suspenders)
+    totals = get_totals()  # Safe: returns {} if table missing/empty
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "totals": totals,
+            "now": datetime.utcnow().strftime("%Y-%m-%d"),
+            # also pass helpers directly (belt & suspenders)
             "fmt_currency": fmt_currency,
             "fmt_pct": fmt_pct,
+            "fmt_int": fmt_int,
         },
     )
 
-# ---------------------------------
-# Ingest/live
-# ---------------------------------
-# If your ingest code lives at app/ingest.py with def ingest_live(...):
-try:
-    import app.ingest as ingest
-except Exception:
-    ingest = None
-    log.warning("app.ingest not importable; /ingest/live will return 501")
-
-def _normalize_ingest_result(raw: Union[Dict[str, Any], Tuple[Any, ...], Any]) -> Tuple[Dict[str, Any], int]:
-    """
-    Accept either:
-      - dict like {"ok": bool, ...}
-      - (dict, status_code)
-      - anything else -> convert to an error dict
-    Returns (dict, http_status)
-    """
-    if isinstance(raw, tuple):
-        # Common patterns: (dict, status), (ok, note) etc.
-        if len(raw) == 2 and isinstance(raw[0], dict) and isinstance(raw[1], int):
-            body, status = raw
-            return body, status
-        # Fallback for unexpected tuple shapes
-        return {"ok": False, "error": "Unexpected tuple from ingest", "raw": str(raw)}, 500
-
-    if isinstance(raw, dict):
-        # If 'ok' is False, use 500; otherwise 200
-        return raw, 200 if raw.get("ok") else 500
-
-    # Anything else is an error
-    return {"ok": False, "error": "Unexpected return from ingest", "raw": str(raw)}, 500
+# -------- Ingest Endpoint --------
+from app import ingest  # keep this import here so the module loads after env is ready
 
 @app.post("/ingest/live")
 def run_live():
-    if ingest is None or not hasattr(ingest, "ingest_live"):
-        return JSONResponse({"ok": False, "error": "ingest not available"}, status_code=501)
     try:
-        raw = ingest.ingest_live(budget_sec=25)
-        body, status = _normalize_ingest_result(raw)
-        # If the ingest happens to include its own preferred status, respect it;
-        # otherwise, fall back to 500 for ok=False and 200 for ok=True
-        status = status if status else (200 if body.get("ok") else 500)
-        return JSONResponse(body, status_code=status)
+        res = ingest.ingest_live(budget_sec=25)  # <-- signature must accept budget_sec
+        if isinstance(res, tuple):
+            # Normalize any legacy tuple to a dict
+            if res and isinstance(res[0], dict):
+                res = res[0]
+            else:
+                res = {"ok": False, "error": "ingest_live returned unexpected type"}
+        if not isinstance(res, dict):
+            res = {"ok": False, "error": "ingest_live returned non-dict response"}
+        return JSONResponse(res, status_code=(200 if res.get("ok") else 500))
     except Exception as e:
         log.exception("ingest/live failed")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
