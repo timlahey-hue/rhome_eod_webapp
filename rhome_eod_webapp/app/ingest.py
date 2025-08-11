@@ -1,181 +1,233 @@
-# rhome_eod_webapp/app/ingest.py
-import os
-import time
-import logging
-from typing import Dict, Tuple, Optional, List
+# app/ingest.py
+import os, time, logging, requests
+from typing import Optional, Tuple, Dict, Any
 
-import requests
+log = logging.getLogger("ingest")
+if not log.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s:ingest:%(message)s"))
+    log.addHandler(handler)
+log.setLevel(logging.INFO)
 
-# --------------------------------------------------------------------
-# Configuration (override via environment variables in Render)
-# --------------------------------------------------------------------
-TENANT_BASE = os.getenv("SIMPRO_BASE_URL", "https://rhome.simprosuite.com").rstrip("/")
-TOKEN_URL = os.getenv("SIMPRO_TOKEN_URL", f"{TENANT_BASE}/oauth2/token")
-API_BASE_URL = os.getenv("SIMPRO_API_BASE_URL", f"{TENANT_BASE}/api/v1.0").rstrip("/")
+# --------- Environment ----------
+BASE_DOMAIN = (os.getenv("SIMPRO_BASE_URL")
+               or os.getenv("SIMPRO_BASE_DOMAIN")
+               or "https://rhome.simprosuite.com").rstrip("/")
+TOKEN_URL = (os.getenv("SIMPRO_TOKEN_URL")
+             or f"{BASE_DOMAIN}/oauth2/token")
 
-CLIENT_ID = os.getenv("SIMPRO_CLIENT_ID")
-CLIENT_SECRET = os.getenv("SIMPRO_CLIENT_SECRET")
-SCOPE = os.getenv("SIMPRO_SCOPE", "").strip()
+CLIENT_ID = os.getenv("SIMPRO_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("SIMPRO_CLIENT_SECRET", "").strip()
+SCOPE = os.getenv("SIMPRO_SCOPE", "").strip() or None
 
-# Try several low-impact endpoints; first 2xx/3xx ends the probe.
-# You can override with SIMPRO_PROBE_ENDPOINTS="/Companies?$top=1,/Jobs?$top=1"
-PROBE_ENDPOINTS: List[str] = [
-    p.strip()
-    for p in os.getenv(
-        "SIMPRO_PROBE_ENDPOINTS",
-        "/Companies?$top=1, /Customers?$top=1, /Jobs?$top=1",
-    ).split(",")
-    if p.strip()
-]
+TIMEOUT = 20
 
-HTTP_TIMEOUT = float(os.getenv("SIMPRO_HTTP_TIMEOUT", "20"))
+class SimproClient:
+    def __init__(self, base_domain: str, client_id: str, client_secret: str, scope: Optional[str]):
+        self.base_domain = base_domain.rstrip("/")
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.scope = scope
+        self._access_token: Optional[str] = None
+        self._token_expiry = 0.0
+        self.session = requests.Session()
 
-logger = logging.getLogger("ingest")
+    # --------- Auth ----------
+    def token(self) -> str:
+        now = time.time()
+        if self._access_token and (self._token_expiry - now) > 60:
+            return self._access_token
 
+        log.info("[ingest] Authenticating with Simpro")
+        data = {"grant_type": "client_credentials"}
+        if self.scope:
+            data["scope"] = self.scope
 
-# --------------------------------------------------------------------
-# OAuth2: Client Credentials
-# --------------------------------------------------------------------
-def _get_access_token(session: Optional[requests.Session] = None) -> Dict[str, str]:
-    """
-    Get an OAuth2 access token using Client Credentials.
-    Sends credentials both via HTTP Basic and in the body for compatibility.
-    """
-    if not CLIENT_ID or not CLIENT_SECRET:
-        raise RuntimeError(
-            "SIMPRO_CLIENT_ID / SIMPRO_CLIENT_SECRET are not set in the environment."
-        )
-
-    data = {
-        "grant_type": "client_credentials",  # per Simpro key file
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-    }
-    if SCOPE:
-        data["scope"] = SCOPE
-
-    sess = session or requests
-    resp = sess.post(
-        TOKEN_URL,
-        data=data,  # x-www-form-urlencoded by default
-        auth=(CLIENT_ID, CLIENT_SECRET),  # many servers accept either/both
-        timeout=HTTP_TIMEOUT,
-    )
-    # Don't raise immediately; we want to log status codes clearly.
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Token request failed (status={resp.status_code}): {resp.text[:300]}"
-        )
-    tok = resp.json()
-    if "access_token" not in tok:
-        raise RuntimeError(f"Token response missing 'access_token': {tok}")
-    return tok
-
-
-# --------------------------------------------------------------------
-# Probing + helpers
-# --------------------------------------------------------------------
-def _auth_headers(access_token: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-        "User-Agent": "rhome-eod-dashboard/1.0",
-    }
-
-
-def _abs_api_url(path: str) -> str:
-    if path.startswith("http://") or path.startswith("https://"):
-        return path
-    if not path.startswith("/"):
-        path = "/" + path
-    return API_BASE_URL + path
-
-
-def _probe_api(access_token: str, session: Optional[requests.Session] = None) -> Tuple[int, str]:
-    """
-    Hit a few benign endpoints until we receive a 2xx/3xx or a hard auth failure.
-    Returns (status_code, detail).
-    """
-    sess = session or requests
-    headers = _auth_headers(access_token)
-
-    last_status = 0
-    last_detail = "no_attempts"
-    for endpoint in PROBE_ENDPOINTS:
-        url = _abs_api_url(endpoint)
+        # Try with HTTP Basic first (many OAuth servers prefer this)
         try:
-            r = sess.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-            last_status = r.status_code
-            if r.status_code in (200, 201, 202, 204, 301, 302):
-                return r.status_code, f"probe_ok:{endpoint}"
-            if r.status_code in (401, 403):
-                # Hard stop: credentials/scope issue
-                return r.status_code, f"probe_auth_failed:{endpoint}"
-            # For 404/400 etc., try the next candidate
-            last_detail = f"probe_{r.status_code}:{endpoint}"
+            r = self.session.post(
+                TOKEN_URL,
+                data=data,
+                auth=(self.client_id, self.client_secret),
+                timeout=TIMEOUT,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if r.status_code >= 400:
+                # Fallback: put client creds in form body
+                data["client_id"] = self.client_id
+                data["client_secret"] = self.client_secret
+                r = self.session.post(
+                    TOKEN_URL,
+                    data=data,
+                    timeout=TIMEOUT,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+            r.raise_for_status()
         except Exception as e:
-            last_status = 0
-            last_detail = f"probe_exception:{endpoint}:{type(e).__name__}:{e}"
-    return last_status, last_detail
+            code = getattr(getattr(e, "response", None), "status_code", "n/a")
+            raise RuntimeError(f"token_error:{code}") from e
 
+        payload = r.json()
+        tok = payload.get("access_token")
+        if not tok:
+            raise RuntimeError("token_missing_access_token")
+        self._access_token = tok
+        self._token_expiry = now + float(payload.get("expires_in") or 3600)
+        log.info("[ingest] Token acquired (len=%s)", len(tok))
+        return tok
 
-# --------------------------------------------------------------------
-# Public entrypoint used by FastAPI route in main.py
-# --------------------------------------------------------------------
-def ingest_live(budget_sec: int = 25) -> Dict[str, object]:
-    """
-    Run a quick, time-bounded ingest cycle.
-    Right now this performs:
-      1) OAuth2 client-credentials auth
-      2) A lightweight API probe to validate the token + base URL
-    If the probe succeeds, this is where you would pull data and write to DB.
-    Returns a dict compatible with the existing /ingest/live route.
-    """
+    def headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.token()}"}
+
+    # --------- Discovery ----------
+    def discover_api_base(self) -> Tuple[str, str]:
+        """
+        Try well-known prefixes and probe /Info to validate.
+        Returns (prefix, note) e.g. ("/api/v1.0", "ok") or ("", "api_status_404")
+        """
+        for prefix in ("/api/v1.0", "/v1.0", ""):
+            url = f"{self.base_domain}{prefix}/Info"
+            try:
+                r = self.session.get(url, headers=self.headers(), timeout=TIMEOUT)
+            except Exception:
+                continue
+            if r.status_code == 401:
+                return prefix, "api_status_401"
+            if 200 <= r.status_code < 300:
+                return prefix, "ok"
+        return "", "api_status_404"
+
+    def probe_jobs(self, api_prefix: str) -> Tuple[Optional[str], str, int]:
+        """
+        Try a few likely Jobs paths + both query styles.
+        Returns (jobs_path, note, http_status)
+        """
+        candidates = [
+            f"{api_prefix}/Jobs",
+            f"{api_prefix}/jobs",
+            f"{api_prefix}/Projects/Jobs",
+        ]
+        for path in candidates:
+            base = f"{self.base_domain}{path}"
+            # Try pageSize first
+            r = self.session.get(base, headers=self.headers(), params={"pageSize": 1}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                return path, "ok", 200
+            if r.status_code == 401:
+                return None, "api_status_401", 401
+            # Try OData-style $top
+            r2 = self.session.get(base, headers=self.headers(), params={"$top": 1}, timeout=TIMEOUT)
+            if r2.status_code == 200:
+                return path, "ok", 200
+            if r2.status_code == 401:
+                return None, "api_status_401", 401
+            # Keep the most recent non-200 code for logging
+            last_status = r2.status_code if r2 is not None else r.status_code
+        return None, "api_status_404", last_status if "last_status" in locals() else 404
+
+    # --------- Fetch ----------
+    def fetch_jobs_sample(self, jobs_path: str) -> Dict[str, Any]:
+        url = f"{self.base_domain}{jobs_path}"
+        # Prefer pageSize; fallback to $top
+        r = self.session.get(url, headers=self.headers(), params={"pageSize": 1}, timeout=TIMEOUT)
+        if r.status_code == 404:
+            r = self.session.get(url, headers=self.headers(), params={"$top": 1}, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+
+# --------- Public entrypoint used by FastAPI route ----------
+def ingest_live(budget_sec: int = 25) -> Dict[str, Any]:
     t0 = time.time()
     run_id = int(t0)
-    jobs_tried = 0
     jobs_inserted = 0
-    note = "init"
-    ok = False
+    jobs_tried = 0
 
-    logger.info("[ingest] Authenticating with Simpro")
+    # Basic env validation
+    if not CLIENT_ID or not CLIENT_SECRET:
+        return {
+            "ok": False,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "jobs_inserted": 0,
+            "jobs_tried": 0,
+            "run_id": run_id,
+            "note": "missing_env:SIMPRO_CLIENT_ID_or_SIMPRO_CLIENT_SECRET",
+        }
+
+    client = SimproClient(BASE_DOMAIN, CLIENT_ID, CLIENT_SECRET, SCOPE)
+    log.info("[ingest] Starting live ingest (budget=%ss)", budget_sec)
+
+    # Discover API base
     try:
-        with requests.Session() as s:
-            token = _get_access_token(s)
-            access_token = token["access_token"]
-            logger.info("[ingest] Token acquired (len=%s)", len(access_token))
+        api_prefix, base_note = client.discover_api_base()
+    except RuntimeError as e:
+        note = str(e)
+        log.warning("[ingest] token acquisition failed (%s)", note)
+        return {
+            "ok": False,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "jobs_inserted": 0,
+            "jobs_tried": 0,
+            "run_id": run_id,
+            "note": note,
+        }
 
-            logger.info("[ingest] Starting live ingest (budget=%ss)", budget_sec)
+    if base_note == "api_status_401":
+        log.warning("[ingest] API base probe returned 401 (check Simpro scopes / allowed grant types)")
+        return {
+            "ok": False, "elapsed_sec": round(time.time() - t0, 3),
+            "jobs_inserted": 0, "jobs_tried": 0, "run_id": run_id,
+            "note": "api_status_401"
+        }
 
-            # --- quick probe to separate auth vs. endpoint issues ---
-            status, detail = _probe_api(access_token, s)
-            if status in (401, 403):
-                # Clear signal we’re authenticated incorrectly or missing scopes
-                logger.warning("[ingest] API probe returned %s (%s)", status, detail)
-                note = f"api_status_{status}"
-                ok = False
-            elif status >= 400 or status == 0:
-                logger.warning(
-                    "[ingest] API probe returned non-success status=%s (%s)", status, detail
-                )
-                note = f"api_status_{status or 'unknown'}"
-                ok = False
-            else:
-                # At this point we know the token works against at least one endpoint.
-                # TODO: pull and upsert your real data here.
-                note = detail
-                ok = True
+    if base_note == "api_status_404":
+        # Could not discover /Info; try the most common base anyway
+        log.warning("[ingest] API base discovery failed; defaulting to /api/v1.0")
+        api_prefix = "/api/v1.0"
 
-    except Exception as e:
-        logger.exception("[ingest] ingest_live failed")
-        note = f"exception:{type(e).__name__}"
+    # Probe Jobs
+    jobs_path, jobs_note, http_status = client.probe_jobs(api_prefix)
+    if jobs_note != "ok":
+        probe_hint = f"{api_prefix}/Jobs"
+        log.warning("[ingest] API probe returned non-success status=%s (probe_%s:%s)",
+                    http_status, http_status, probe_hint if jobs_path is None else jobs_path)
+        return {
+            "ok": False,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "jobs_inserted": 0,
+            "jobs_tried": 0,
+            "run_id": run_id,
+            "note": f"probe_{http_status}:{(jobs_path or probe_hint)}",
+        }
 
-    elapsed = round(time.time() - t0, 3)
+    # Fetch a small sample to confirm we can read Jobs
+    try:
+        payload = client.fetch_jobs_sample(jobs_path)
+        # Shape can vary; try a few common patterns
+        items = payload.get("items") or payload.get("data") or payload.get("results") or payload
+        if isinstance(items, dict):
+            items = [items]
+        jobs_tried = len(items) if isinstance(items, list) else 0
+    except Exception:
+        log.exception("[ingest] Jobs fetch failed")
+        return {
+            "ok": False,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "jobs_inserted": 0,
+            "jobs_tried": 0,
+            "run_id": run_id,
+            "note": "jobs_fetch_failed",
+        }
+
+    # (Optional) insert into DB here if needed. For now we confirm connectivity only.
     return {
-        "ok": bool(ok),
-        "elapsed_sec": elapsed,
-        "jobs_inserted": int(jobs_inserted),
-        "jobs_tried": int(jobs_tried),
+        "ok": True,
+        "elapsed_sec": round(time.time() - t0, 3),
+        "jobs_inserted": jobs_inserted,
+        "jobs_tried": jobs_tried,
         "run_id": run_id,
-        "note": note,
+        "note": f"ok:{jobs_path}",
     }
+
+if __name__ == "__main__":
+    # Quick local smoke test
+    print(ingest_live())
