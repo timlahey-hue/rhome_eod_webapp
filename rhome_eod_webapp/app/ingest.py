@@ -1,148 +1,165 @@
 import os
 import time
 import logging
-import requests
-import xml.etree.ElementTree as ET
+import sqlite3
+from decimal import Decimal, InvalidOperation
+from typing import Dict, Any, Optional
 
-logger = logging.getLogger("ingest")
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
-SIMPRO_BASE_URL = os.environ.get("SIMPRO_BASE_URL", "https://rhome.simprosuite.com")
-SIMPRO_TOKEN_URL = os.environ.get("SIMPRO_TOKEN_URL", f"{SIMPRO_BASE_URL}/oauth2/token")
-SIMPRO_CLIENT_ID = os.environ.get("SIMPRO_CLIENT_ID", "")
-SIMPRO_CLIENT_SECRET = os.environ.get("SIMPRO_CLIENT_SECRET", "")
+# ------------------------------------------------------------------------------
+# App & logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
+log = logging.getLogger("app")
 
-def _json_result(ok: bool, note: str, t0: float, **kw):
-    out = {"ok": ok, "note": note, "elapsed_sec": round(time.time() - t0, 3), "run_id": int(t0)}
-    out.update(kw)
-    return out
+app = FastAPI()
 
-def _get_token():
-    t0 = time.time()
-    if not SIMPRO_CLIENT_ID or not SIMPRO_CLIENT_SECRET:
-        return _json_result(False, "missing_env:SIMPRO_CLIENT_ID_or_SIMPRO_CLIENT_SECRET", t0)
+# If you serve static files (optional; remove if you don't use /static)
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+# ------------------------------------------------------------------------------
+# Jinja helpers (fixes: UndefinedError: 'fmt_currency' / 'fmt_pct')
+# ------------------------------------------------------------------------------
+def fmt_currency(value: Optional[float]) -> str:
+    if value is None:
+        return "$0"
     try:
-        # EXACTLY like your working curl: Basic auth + grant_type=client_credentials
-        r = requests.post(
-            SIMPRO_TOKEN_URL,
-            data={"grant_type": "client_credentials"},
-            auth=(SIMPRO_CLIENT_ID, SIMPRO_CLIENT_SECRET),
-            timeout=30,
-        )
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return "$0"
+    # No decimals to match prior look; change to :,.2f if you prefer cents
+    return f"${d:,.0f}"
+
+def fmt_int(value: Optional[float]) -> str:
+    try:
+        return f"{int(round(float(value or 0))):,}"
+    except (ValueError, TypeError):
+        return "0"
+
+def fmt_pct(value: Optional[float]) -> str:
+    if value is None:
+        return "0.0%"
+    try:
+        f = float(value)
+    except (ValueError, TypeError):
+        return "0.0%"
+    # If it's 0-1, assume ratio; if >1 assume already percent
+    pct = f * 100.0 if -1.0 <= f <= 1.0 else f
+    return f"{pct:.1f}%"
+
+# make these available in templates
+templates.env.globals.update(
+    fmt_currency=fmt_currency,
+    fmt_int=fmt_int,
+    fmt_pct=fmt_pct,
+)
+
+# ------------------------------------------------------------------------------
+# DB helpers (defensive: don't crash if table missing)
+# ------------------------------------------------------------------------------
+DB_PATH = os.path.join(os.path.dirname(__file__), "eod.db")
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_totals() -> Dict[str, Any]:
+    """
+    Returns a dict of totals; if the 'totals' table is missing or empty,
+    return an empty dict and log, but DO NOT raise (prevents 500s).
+    """
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        # Check table existence
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='totals'")
+        if not cur.fetchone():
+            log.error("get_totals(): 'totals' table not found; returning empty dict")
+            return {}
+        # Try a few common shapes (row-per-key or single-latest row)
+        # 1) row-per-key: key TEXT, value NUMERIC
+        try:
+            cur.execute("SELECT key, value FROM totals")
+            rows = cur.fetchall()
+            if rows and "key" in rows[0].keys():
+                return {r["key"]: r["value"] for r in rows}
+        except sqlite3.OperationalError:
+            pass
+
+        # 2) latest snapshot row: assume columns include the metrics
+        #    (change columns to match your schema)
+        snapshot_cols = [
+            "labour_cost_today",
+            "mtd_gm_pct",
+            "mtd_gm",
+            "mtd_revenue",
+            "mtd_labour",
+            "mtd_materials",
+            "mtd_other",
+        ]
+        cols_csv = ", ".join(snapshot_cols)
+        try:
+            cur.execute(f"SELECT {cols_csv} FROM totals ORDER BY rowid DESC LIMIT 1")
+            row = cur.fetchone()
+            return dict(row) if row else {}
+        except sqlite3.OperationalError:
+            log.warning("get_totals(): 'totals' exists but schema unknown; returning {}")
+            return {}
     except Exception as e:
-        logger.exception("[ingest] token request failed")
-        return _json_result(False, "token_request_failed", t0, error=str(e))
+        log.exception("get_totals(): unexpected error; returning {}")
+        return {}
 
-    if r.status_code != 200:
-        logger.error("[ingest] auth_error:token_status_%s %s", r.status_code, r.text)
-        return _json_result(False, f"auth_error:token_status_{r.status_code}", t0)
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": int(time.time())}
 
-    token = r.json().get("access_token")
-    return _json_result(True, "token_ok", t0, token=token)
+@app.get("/")
+def home(request: Request):
+    totals = get_totals()
+    # Never let missing helpers or keys 500 the page again
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request, "totals": totals, "now": int(time.time())},
+    )
 
-def _probe_candidates(session: requests.Session, candidates):
+# --- ingest -------------------------------------------------------------------
+try:
+    # local package import (this file sits in app/, alongside ingest.py)
+    from .ingest import ingest_live
+except Exception as e:  # pragma: no cover
+    ingest_live = None
+    log.error("ingest_live import failed; POST /ingest/live will return a stub")
+
+@app.post("/ingest/live")
+def ingest_live_route():
     """
-    Try to discover an API base by probing for OData metadata or an index that returns 200.
-    Returns (base_path, metadata_text_or_None).
+    POST /ingest/live
+    Always returns 200 with a JSON body describing what happened.
     """
-    for base in candidates:
-        # Prefer $metadata if it's an OData service
-        for tail in ("/$metadata", "/"):
-            url = SIMPRO_BASE_URL + base + tail
-            try:
-                resp = session.get(url, timeout=15)
-            except Exception:
-                continue
-            if resp.status_code == 200:
-                return base, resp.text if tail == "/$metadata" else None
-    return None, None
+    if ingest_live is None:
+        log.error("ingest_live not available")
+        return JSONResponse({"ok": False, "error": "ingest_live not available", "elapsed_sec": 0.0})
 
-def _discover_jobs_entity(metadata_xml: str | None):
-    if not metadata_xml:
-        return None
+    started = time.time()
     try:
-        root = ET.fromstring(metadata_xml)
-    except Exception:
-        return None
-    # Try to find an EntitySet with "job" in its name
-    for es in root.findall(".//{*}EntitySet"):
-        name = es.attrib.get("Name", "")
-        if "job" in name.lower():
-            return name  # e.g., "Jobs", "JobHeaders", etc.
-    return None
-
-def _get(session: requests.Session, path: str):
-    return session.get(SIMPRO_BASE_URL + path, timeout=30)
-
-def ingest_diag():
-    """
-    Lightweight diagnostics: verifies token, tries to discover base, and guesses a Jobs-like entity.
-    """
-    t0 = time.time()
-    tok = _get_token()
-    if not tok["ok"]:
-        return tok
-
-    s = requests.Session()
-    s.headers.update({"Authorization": f"Bearer {tok['token']}"})
-
-    base_candidates = ["/api/v1.0", "/api/v2.0", "/odata/v4", "/api", ""]
-    base, meta = _probe_candidates(s, base_candidates)
-    info = {
-        "ok": True,
-        "note": "diag_ok",
-        "elapsed_sec": round(time.time() - t0, 3),
-        "base_detected": base,
-        "has_metadata": bool(meta),
-    }
-    if meta:
-        info["jobs_entity_guess"] = _discover_jobs_entity(meta)
-    return info
-
-def ingest_live():
-    """
-    Try to locate a working Jobs-like endpoint and probe it. If none found,
-    returns a structured diagnostic instead of failing.
-    """
-    t0 = time.time()
-    tok = _get_token()
-    if not tok["ok"]:
-        return tok
-
-    s = requests.Session()
-    s.headers.update({"Authorization": f"Bearer {tok['token']}"})
-
-    base_candidates = ["/api/v1.0", "/api/v2.0", "/odata/v4", "/api", ""]
-    base, meta = _probe_candidates(s, base_candidates)
-    tried = []
-
-    if not base:
-        # Keep behavior you saw in logs for transparency
-        tried.append("/api/v1.0/Jobs")
-        logger.warning("[ingest] API base discovery failed; defaulting to /api/v1.0")
-        base = "/api/v1.0"
-
-    # If we have metadata, try to auto-find any EntitySet with 'job' in the name
-    jobs_entity = _discover_jobs_entity(meta) if meta else None
-    if jobs_entity:
-        path = f"{base}/{jobs_entity}"
-        tried.append(path)
-        r = _get(s, f"{path}?$top=1")
-        if r.status_code == 200:
-            return _json_result(True, "probe_ok", t0, jobs_tried=1, jobs_inserted=0, path=path)
-
-    # Fall back to common guesses (case/shape variants)
-    for path in [
-        f"{base}/Jobs",
-        f"{base}/jobs",
-        f"{base}/Companies(0)/Jobs",
-        f"{base}/companies/0/jobs",
-        f"{base}/companies(1)/jobs",
-    ]:
-        tried.append(path)
-        r = _get(s, f"{path}?$top=1")
-        if r.status_code == 200:
-            return _json_result(True, "probe_ok_path", t0, jobs_tried=1, jobs_inserted=0, path=path)
-
-    logger.warning("[ingest] no jobs endpoint found; tried: %s", ", ".join(tried))
-    return _json_result(False, "probe_404:no_jobs_endpoint_found", t0, jobs_tried=0, jobs_inserted=0, tried=tried)
+        result = ingest_live()
+    except Exception as e:
+        log.exception("ingest_live crashed")
+        result = {"ok": False, "error": "ingest_live crashed", "note": str(e)}
+    result.setdefault("elapsed_sec", round(time.time() - started, 3))
+    return JSONResponse(result)
