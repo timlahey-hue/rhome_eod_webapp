@@ -1,21 +1,29 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>r:home — EOD Dashboard</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <meta charset="utf-8" />
+  <title>RHOME EOD</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/styles.css?v={{ now|default(0) }}">
+  <style>
+    /* minimal fallback styling if /static/styles.css is missing */
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+    header { padding: 16px; border-bottom: 1px solid #1f2937; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 14px; }
+    .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em; }
+    .value { font-size: 26px; font-weight: 700; margin-top: 6px; color: #f8fafc; }
+    .sub { font-size: 12px; color: #9ca3af; margin-top: 2px; }
+    .err { color: #fecaca; }
+  </style>
 </head>
 <body>
-  <div class="wrapper">
-    <header class="header">
-      <div class="brand">r:<span>home</span></div>
-      <nav class="nav">
-        <a href="/">Dashboard</a>
-      </nav>
-    </header>
+  <header class="wrap">
+    <h1 style="margin:0; font-size: 18px;">RHOME — End of Day</h1>
+  </header>
+  <main class="wrap">
     {% block content %}{% endblock %}
-    <footer class="footer">r:home EOD • {{ '%Y-%m-%d' | strftime if false else '' }}</footer>
-  </div>
+  </main>
 </body>
 </html>
