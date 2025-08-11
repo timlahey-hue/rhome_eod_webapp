@@ -1,33 +1,17 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <title>RHome EOD</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <link rel="stylesheet" href="/static/styles.css"/>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#0f1115; color:#e8eaed; }
-    header { padding:16px 20px; border-bottom:1px solid #222531; }
-    main { padding:20px; }
-    h1 { font-size:18px; margin:0; font-weight:600; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:14px; }
-    .card { background:#151825; border:1px solid #1e2233; border-radius:12px; padding:14px; }
-    .label { font-size:12px; color:#9aa0a6; margin-bottom:8px; }
-    .value { font-size:22px; font-weight:700; letter-spacing:.2px; }
-    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:16px 0; }
-    button, .btn { background:#2563eb; color:white; border:none; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
-    .muted { color:#9aa0a6; font-size:12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-    a { color:#9abaff; text-decoration:none; }
-    a:hover { text-decoration:underline; }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>RHome EOD Dashboard</h1>
-  </header>
-  <main>
-    {% block content %}{% endblock %}
-  </main>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <title>RHOME EOD</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link href="/static/styles.css" rel="stylesheet" />
+  </head>
+  <body>
+    <header>
+      <h1>RHOME EOD Dashboard</h1>
+    </header>
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
 </html>
