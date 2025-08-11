@@ -1,235 +1,238 @@
-# app/ingest.py
+# ingest.py
 import os
 import time
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urljoin
-
+import base64
 import requests
+import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
 
-log = logging.getLogger("ingest")
-log.setLevel(logging.INFO)
+# ---------- logging ----------
+logger = logging.getLogger("ingest")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("INGEST %(levelname)s: %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
 
-# ---- Configuration helpers ---------------------------------------------------
+REQ_TIMEOUT = (5, 20)  # (connect, read)
 
-def _env(name: str, default: Optional[str] = None) -> str:
-    val = os.getenv(name, default)
-    if val is None:
-        raise RuntimeError(f"Required environment variable {name} is not set")
-    return val
+# ---------- env ----------
+BASE_URL = os.getenv("SIMPRO_BASE_URL", "").strip().rstrip("/")
+TOKEN_URL = os.getenv("SIMPRO_TOKEN_URL", "").strip()
+CLIENT_ID = os.getenv("SIMPRO_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("SIMPRO_CLIENT_SECRET", "").strip()
+SCOPE = os.getenv("SIMPRO_SCOPE", "api").strip()
 
-def _derive_base_url_from_token_url(token_url: str) -> str:
-    """
-    Derive https://<tenant>.simprosuite.com from a token URL like
-    https://<tenant>.simprosuite.com/oauth/token
-    """
-    p = urlparse(token_url)
-    return f"{p.scheme}://{p.netloc}"
+# Optional hints/overrides
+API_BASE_HINT = os.getenv("SIMPRO_API_BASE", "").strip().rstrip("/")    # e.g. "/api" or "/api/v1.0"
+JOBS_ENTITY_HINT = os.getenv("SIMPRO_JOBS_ENTITY", "").strip()          # e.g. "Jobs"
 
-# ---- OAuth2 client-credentials -----------------------------------------------
+# Reasonable service-root candidates observed across Simpro builds
+DEFAULT_BASE_CANDIDATES = [
+    "/api/v1.0",
+    "/api",               # many tenants expose OData here
+    "/odata",
+    "/api/v1",            # just in case
+    "/v1.0",
+]
 
-def _get_access_token() -> Tuple[bool, Optional[str], str]:
-    """
-    Returns (ok, access_token or None, note)
-    """
-    token_url = _env("SIMPRO_TOKEN_URL")
-    client_id = _env("SIMPRO_CLIENT_ID")
-    client_secret = _env("SIMPRO_CLIENT_SECRET")
+# ---------- helpers ----------
+def _bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
-    try:
-        # Simpro uses standard client-credentials on /oauth/token
-        # Either HTTP Basic or form creds both work; we’ll send in the form.
-        data = {
-            "grant_type": "client_credentials",
-            # Some tenants require a scope; leave blank unless you’ve configured one.
-            # "scope": os.getenv("SIMPRO_SCOPE", ""),
-        }
-        resp = requests.post(
-            token_url,
-            data=data,
-            auth=(client_id, client_secret),
-            headers={"Accept": "application/json"},
-            timeout=15,
-        )
-    except Exception as e:
-        return False, None, f"token_error:{e}"
+def _require_env(name: str, value: str):
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
 
+def _ensure_urls():
+    _require_env("SIMPRO_BASE_URL", BASE_URL or "")
+    # If TOKEN_URL not supplied, infer from tenant base
+    if not TOKEN_URL:
+        # Typical pattern from your key file:
+        #   https://<tenant>.simprosuite.com/oauth2/token
+        return f"{BASE_URL}/oauth2/token"
+    return TOKEN_URL
+
+def _get_token() -> str:
+    token_url = _ensure_urls()
+    logger.info("[ingest] Authenticating with Simpro")
+    # Client Credentials grant. Simpro accepts either Basic auth or client_id/client_secret in form.
+    # Prefer Basic for interoperability.
+    basic = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+    headers = {"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"}
+    data = {"grant_type": "client_credentials", "scope": SCOPE}
+    resp = requests.post(token_url, headers=headers, data=data, timeout=REQ_TIMEOUT)
     if resp.status_code != 200:
-        return False, None, f"token_status_{resp.status_code}"
-
-    try:
-        payload = resp.json()
-    except Exception:
-        return False, None, "token_parse_error"
-
-    token = payload.get("access_token")
+        raise RuntimeError(f"token_status_{resp.status_code}")
+    token = resp.json().get("access_token", "")
     if not token:
-        return False, None, "token_missing_access_token"
+        raise RuntimeError("token_missing")
+    logger.info("[indigest? nope][ingest] Token acquired (len=%d)", len(token))
+    return token
 
-    return True, token, "token_ok"
+def _fetch(url: str, headers: dict, params=None, accept_xml=False):
+    h = dict(headers)
+    if accept_xml:
+        h["Accept"] = "application/xml, text/xml;q=0.9, */*;q=0.1"
+    return requests.get(url, headers=h, params=params, timeout=REQ_TIMEOUT)
 
-# ---- API probing --------------------------------------------------------------
-
-def _pick_api_base(host_base: str) -> Tuple[str, str]:
+def _discover_service_root(base_url: str, token: str):
     """
-    Decide base path. Default to /api/v1.0, but allow override via env.
-    Returns (api_base_url, note)
+    Try a series of service-root candidates and return:
+        (service_root_url, entity_sets: set[str], raw_metadata_xml)
+    or (None, None, None) if not found.
     """
-    base_path = os.getenv("SIMPRO_API_BASE_PATH", "/api/v1.0").rstrip("/")
-    api_base = f"{host_base}{base_path}"
-    # We could probe $metadata or /info, but some tenants block those.
-    # Keep it simple; log that we defaulted.
-    return api_base, "api_base_defaulted"
+    tried = []
+    candidates = []
+    if API_BASE_HINT:
+        candidates.append(API_BASE_HINT)  # user override first
+    candidates += DEFAULT_BASE_CANDIDATES
 
-def _first_working_jobs_path(
-    api_base: str,
-    token: str,
-    company_id: str,
-) -> Tuple[Optional[str], str, Optional[int]]:
-    """
-    Try a list of likely Jobs endpoints. Return (full_url, note, status_code)
-    NOTE: We append a tiny query to keep payloads small when OData is supported.
-    """
-    # Order matters: companies/{id}/jobs is the most common shape for Jobs.
-    candidates = [
-        f"/companies/{company_id}/jobs",
-        f"/Companies({company_id})/Jobs",  # OData casing
-        "/jobs",
-        "/Jobs",
-    ]
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    last_status = None
-    for path in candidates:
-        # Prefer a very light probe ($top=1 when OData works; harmless if ignored)
-        probe_url = f"{api_base}{path}"
+    for base in candidates:
+        service_root = f"{base_url}{base}"
+        meta_url = f"{service_root}/$metadata"
         try:
-            resp = requests.get(
-                probe_url,
-                params={"$top": 1},
-                headers=headers,
-                timeout=20,
-            )
-            last_status = resp.status_code
-            if 200 <= resp.status_code < 300:
-                return probe_url, f"probe_ok:{path}", resp.status_code
-            else:
-                log.warning("ingest: [ingest] API probe returned non-success status=%s (path=%s)",
-                            resp.status_code, path)
-        except Exception as e:
-            log.warning("ingest: [ingest] probe error for %s: %s", path, e)
+            r = _fetch(meta_url, _bearer(token), accept_xml=True)
+            tried.append((base, r.status_code))
+            if r.status_code == 200 and r.text:
+                try:
+                    # Parse entity sets from OData $metadata
+                    entity_sets = set()
+                    # OData namespaces vary; do a simple name search
+                    root = ET.fromstring(r.text)
+                    # Look for all <EntitySet Name="...">
+                    for elem in root.iter():
+                        if elem.tag.endswith("EntitySet") and "Name" in elem.attrib:
+                            entity_sets.add(elem.attrib["Name"])
+                    if entity_sets:
+                        return service_root, entity_sets, r.text, tried
+                    else:
+                        # Metadata present but weird? Still return so we can inspect.
+                        return service_root, set(), r.text, tried
+                except ET.ParseError:
+                    # Not XML; ignore and keep looking
+                    pass
+        except requests.RequestException:
+            tried.append((base, "error"))
+            continue
+    return None, None, None, tried
 
-    note = f"probe_{last_status if last_status is not None else 'error'}:no_jobs_endpoint_found"
-    return None, note, last_status
+def _choose_jobs_entity(entity_sets: set[str]) -> str | None:
+    if not entity_sets:
+        return None
+    # Preferred names in order; extend if we learn your tenant uses a variant
+    preferences = [
+        "Jobs", "JobHeaders", "Job", "JobsV1", "ProjectJobs"
+    ]
+    # Honor explicit override
+    if JOBS_ENTITY_HINT:
+        return JOBS_ENTITY_HINT if JOBS_ENTITY_HINT in entity_sets else None
+    for name in preferences:
+        if name in entity_sets:
+            return name
+    # As a fallback, try a case-insensitive match for "job"
+    lowered = {e.lower(): e for e in entity_sets}
+    for key in ["jobs", "jobheaders", "job"]:
+        if key in lowered:
+            return lowered[key]
+    return None
 
-# ---- Fetch one small page of jobs (for smoke test) ----------------------------
+def _probe_jobs(service_root: str, token: str, jobs_entity: str):
+    # Confirm the entity set exists by asking for one record
+    probe_url = f"{service_root}/{jobs_entity}"
+    r = _fetch(probe_url, _bearer(token), params={"$top": 1})
+    return r.status_code, r.text[:4000] if r.text else ""
 
-def _fetch_sample_jobs(jobs_url: str, token: str) -> Tuple[bool, int, str]:
+# ---------- public entry ----------
+def ingest_live(budget_sec: int = 25) -> dict:
     """
-    Returns (ok, count, note)
-    """
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-    try:
-        resp = requests.get(jobs_url, params={"$top": 5}, headers=headers, timeout=30)
-    except Exception as e:
-        return False, 0, f"jobs_error:{e}"
-
-    if resp.status_code == 401:
-        return False, 0, "api_status_401"
-    if resp.status_code == 403:
-        return False, 0, "api_status_403"
-    if resp.status_code == 404:
-        return False, 0, "api_status_404"
-    if not (200 <= resp.status_code < 300):
-        return False, 0, f"api_status_{resp.status_code}"
-
-    # Try to count list length in a few common shapes
-    try:
-        data = resp.json()
-    except Exception:
-        return True, 0, "jobs_ok_parse_error"
-
-    count = 0
-    if isinstance(data, dict):
-        if "value" in data and isinstance(data["value"], list):  # OData shape
-            count = len(data["value"])
-        elif "items" in data and isinstance(data["items"], list):
-            count = len(data["items"])
-        else:
-            # If dict but unknown shape, best-effort: count heuristically
-            for key in ("jobs", "Jobs", "results"):
-                if key in data and isinstance(data[key], list):
-                    count = len(data[key])
-                    break
-    elif isinstance(data, list):
-        count = len(data)
-
-    return True, count, "jobs_ok"
-
-# ---- Public entrypoint used by /ingest/live -----------------------------------
-
-def ingest_live(budget_sec: int = 25) -> Dict:
-    """
-    Smoke-test Simpro connectivity and locate the Jobs endpoint.
-    Designed to be called by the FastAPI route and return a friendly JSON.
+    Returns a dict shaped like:
+      {
+        "ok": bool,
+        "elapsed_sec": float,
+        "jobs_inserted": int,
+        "jobs_tried": int,
+        "run_id": int,
+        "note": str
+      }
+    We currently focus on service discovery + probe; once the path is confirmed,
+    we’ll expand to actual ingestion.
     """
     t0 = time.time()
-    run_id = int(t0)  # simple run id
-    company_id = os.getenv("SIMPRO_COMPANY_ID", "0")
+    run_id = int(t0)
+    jobs_inserted = 0
+    jobs_tried = 0
+    note_parts = []
 
-    # 1) Token
-    ok, token, note = _get_access_token()
-    if not ok or not token:
+    try:
+        token = _get_token()
+        note_parts.append("auth_ok")
+    except Exception as e:
+        msg = f"auth_error:{e}"
+        logger.error("[ingest] %s", msg)
         return {
             "ok": False,
             "elapsed_sec": round(time.time() - t0, 3),
-            "jobs_inserted": 0,
-            "jobs_tried": 0,
+            "jobs_inserted": jobs_inserted,
+            "jobs_tried": jobs_tried,
             "run_id": run_id,
-            "note": note,
+            "note": msg,
         }
-    log.info("ingest:[ingest] Token acquired (len=%s)", len(token))
 
-    # 2) Build API base
-    host_base = os.getenv("SIMPRO_BASE_URL")
-    if not host_base:
-        # Derive from token URL host
-        host_base = _derive_base_url_from_token_url(_env("SIMPRO_TOKEN_URL"))
-    api_base, base_note = _pick_api_base(host_base)
-    if base_note != "api_base_defaulted":
-        log.info("ingest:[ingest] %s", base_note)
-    else:
-        log.warning("ingest:[ingest] API base discovery failed; defaulting to /api/v1.0")
-
-    # 3) Find a working Jobs URL
-    jobs_url, probe_note, last_status = _first_working_jobs_path(api_base, token, company_id)
-    if not jobs_url:
+    # Discover base
+    service_root, entity_sets, metadata, tried = _discover_service_root(BASE_URL, token)
+    if not service_root:
+        logger.warning("[ingest] API base discovery failed; tried=%s", tried)
         return {
             "ok": False,
             "elapsed_sec": round(time.time() - t0, 3),
-            "jobs_inserted": 0,
-            "jobs_tried": 0,
+            "jobs_inserted": jobs_inserted,
+            "jobs_tried": jobs_tried,
             "run_id": run_id,
-            "note": probe_note,
+            "note": "no_odata_metadata;" + json.dumps(tried),
         }
 
-    # 4) Fetch a tiny page to confirm (don’t write to DB yet)
-    ok, count, fetch_note = _fetch_sample_jobs(jobs_url, token)
-    elapsed = round(time.time() - t0, 3)
+    base_path = service_root.replace(BASE_URL, "", 1) or "/"
+    note_parts.append(f"base={base_path}")
+
+    # Choose the likely jobs entity
+    jobs_entity = _choose_jobs_entity(entity_sets or set())
+    if not jobs_entity:
+        logger.warning("[ingest] No jobs-like entity found in metadata; sets=%s", sorted(list(entity_sets or [])))
+        return {
+            "ok": False,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "jobs_inserted": jobs_inserted,
+            "jobs_tried": jobs_tried,
+            "run_id": run_id,
+            "note": "no_jobs_entity_in_metadata",
+        }
+
+    note_parts.append(f"jobs_set={jobs_entity}")
+
+    # Probe it
+    status, body = _probe_jobs(service_root, token, jobs_entity)
+    if status != 200:
+        logger.warning("[ingest] API probe returned non-success status=%s (path=%s/%s)", status, base_path, jobs_entity)
+        return {
+            "ok": False,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "jobs_inserted": jobs_inserted,
+            "jobs_tried": jobs_tried,
+            "run_id": run_id,
+            "note": f"probe_{status}:{base_path}/{jobs_entity}",
+        }
+
+    # If we get here, we can see the Jobs entity set. (Do real ingest next)
+    logger.info("[ingest] Jobs endpoint confirmed at %s/%s", base_path, jobs_entity)
+
     return {
-        "ok": ok,
-        "elapsed_sec": elapsed,
-        "jobs_inserted": 0,  # not inserting yet; this is a connectivity/smoke test
-        "jobs_tried": count,
+        "ok": True,
+        "elapsed_sec": round(time.time() - t0, 3),
+        "jobs_inserted": jobs_inserted,  # will be >0 once we implement inserts
+        "jobs_tried": jobs_tried,
         "run_id": run_id,
-        "note": fetch_note if ok else fetch_note or probe_note,
-        "jobs_endpoint": jobs_url,  # helpful for logs
+        "note": ";".join(note_parts) or "ok",
     }
