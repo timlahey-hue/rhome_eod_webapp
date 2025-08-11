@@ -1,29 +1,33 @@
 {% extends "base.html" %}
 {% block content %}
-  <div class="row">
-    <form action="/ingest/live" method="post">
-      <button type="submit">Run Live Ingest</button>
-    </form>
-    <a class="btn" href="/ingest/ping">Ping Simpro</a>
-    <div class="muted">Now: <span class="mono">{{ now }}</span></div>
+
+<div class="cards">
+  <div class="card">
+    <div class="label">Labour $ Today</div>
+    <div class="value">{{ fmt_currency(totals.get('labour_cost_today')) }}</div>
   </div>
-
-  <div class="grid">
-    <div class="card"><div class="label">Revenue Today</div><div class="value">{{ fmt_currency(totals.get('revenue_today', 0)) }}</div></div>
-    <div class="card"><div class="label">Revenue MTD</div><div class="value">{{ fmt_currency(totals.get('revenue_mtd', 0)) }}</div></div>
-
-    <div class="card"><div class="label">Materials $ Today</div><div class="value">{{ fmt_currency(totals.get('materials_cost_today', 0)) }}</div></div>
-    <div class="card"><div class="label">Materials $ MTD</div><div class="value">{{ fmt_currency(totals.get('materials_cost_mtd', 0)) }}</div></div>
-
-    <div class="card"><div class="label">Labour $ Today</div><div class="value">{{ fmt_currency(totals.get('labour_cost_today', 0)) }}</div></div>
-    <div class="card"><div class="label">Labour $ MTD</div><div class="value">{{ fmt_currency(totals.get('labour_cost_mtd', 0)) }}</div></div>
-
-    <div class="card"><div class="label">MTD GM%</div><div class="value">{{ fmt_pct(totals.get('mtd_gm_pct', 0)) }}</div></div>
-
-    <div class="card">
-      <div class="label">Ingest</div>
-      <div class="value">{{ fmt_int(totals.get('jobs_ingested', 0)) }} jobs</div>
-      <div class="muted">Last run: {{ hms(totals.get('last_ingest_ts')) }}</div>
-    </div>
+  <div class="card">
+    <div class="label">Revenue Today</div>
+    <div class="value">{{ fmt_currency(totals.get('revenue_today')) }}</div>
   </div>
+  <div class="card">
+    <div class="label">MTD Revenue</div>
+    <div class="value">{{ fmt_currency(totals.get('mtd_revenue')) }}</div>
+  </div>
+  <div class="card">
+    <div class="label">MTD GM%</div>
+    <div class="value">{{ fmt_pct(totals.get('mtd_gm_pct')) }}</div>
+  </div>
+</div>
+
+<section style="margin-top: 2rem;">
+  <form method="post" action="/ingest/live">
+    <button type="submit">Run Live Ingest</button>
+  </form>
+  <p style="margin-top: .5rem; font-size: .9rem; opacity:.8;">
+    Tip: set <code>SIMPRO_API_BASE</code> (e.g. <code>https://api-us.simprocloud.com/v1.0</code>) and optionally
+    <code>SIMPRO_COMPANY_ID</code> in your Render env. Auth uses <code>SIMPRO_TENANT_BASE</code> (e.g. <code>https://rhome.simprosuite.com</code>).
+  </p>
+</section>
+
 {% endblock %}
