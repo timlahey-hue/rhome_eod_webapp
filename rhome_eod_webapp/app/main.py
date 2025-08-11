@@ -1,121 +1,137 @@
-# app/main.py
-import logging
+# rhome_eod_webapp/app/main.py
+import os
+import time
 import sqlite3
-from pathlib import Path
-from typing import Dict, Any
-
+import logging
+import inspect
+from datetime import datetime
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
-from . import ingest  # our local ingest.py
-
-log = logging.getLogger("app")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
-)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("app")
 
 app = FastAPI()
 
-# Static files (if you have app/static)
-static_dir = Path(__file__).parent / "static"
-if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+BASE_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+# --- Static & Templates -------------------------------------------------------
+static_dir = os.path.join(BASE_DIR, "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# ---- Jinja filters (fixes 'fmt_currency' / 'fmt_pct' undefined) ----
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
 def fmt_currency(value):
     try:
         if value is None:
-            return "$0"
-        return "${:,.0f}".format(float(value))
+            return "-"
+        return "${:,.2f}".format(float(value))
     except Exception:
-        return "$0"
+        return str(value)
 
 def fmt_pct(value):
     try:
         if value is None:
-            return "0%"
-        return "{:.0f}%".format(float(value) * 100 if float(value) <= 1 else float(value))
+            return "-"
+        v = float(value)
+        # If it looks like 0.123 treat as 12.3%; if 12.3 treat as 12.3%
+        return "{:,.1f}%".format(v * 100.0 if abs(v) <= 1.0 else v)
     except Exception:
-        return "0%"
+        return str(value)
 
-templates.env.filters["fmt_currency"] = fmt_currency
-templates.env.filters["fmt_pct"] = fmt_pct
-
-# ---- DB helpers ----
-DB_PATH = Path(__file__).parent.parent / "eod.db"
-
-def get_totals() -> Dict[str, Any]:
-    if not DB_PATH.exists():
-        log.error("get_totals(): DB file not found at %s; returning empty dict", DB_PATH)
-        return {}
+def fmt_int(value):
     try:
-        con = sqlite3.connect(str(DB_PATH))
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
-        # If 'totals' table doesn't exist, handle gracefully
-        cur.execute("""
-            SELECT
-                hours_today,
-                labour_cost_today,
-                mtd_gm_pct
-            FROM totals
-            ORDER BY asof DESC
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        con.close()
-        return dict(row) if row else {}
-    except sqlite3.OperationalError as e:
-        if "no such table: totals" in str(e).lower():
-            log.error("get_totals(): 'totals' table not found; returning empty dict")
-            return {}
-        raise
+        if value is None:
+            return "0"
+        return "{:,}".format(int(round(float(value))))
+    except Exception:
+        return str(value)
 
-# ---- Routes ----
-@app.get("/", response_class=HTMLResponse)
+# Make these available to all templates
+templates.env.globals.update(
+    fmt_currency=fmt_currency, fmt_pct=fmt_pct, fmt_int=fmt_int
+)
+templates.env.filters["currency"] = fmt_currency
+templates.env.filters["pct"] = fmt_pct
+templates.env.filters["intfmt"] = fmt_int
+
+# --- DB helpers ---------------------------------------------------------------
+DB_PATH = os.environ.get("EOD_DB_PATH", os.path.join(ROOT_DIR, "eod.db"))
+
+def _get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_totals():
+    try:
+        with _get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM totals ORDER BY snapshot_ts DESC LIMIT 1")
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        # Don't explode the homepage if the table isn't present yet
+        logger.error("get_totals(): 'totals' table not found; returning empty dict")
+        return {}
+
+# --- Routes -------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": int(time.time())}
+
+@app.get("/")
 def home(request: Request):
     totals = get_totals()
-    # Provide defaults so the template always renders
-    totals = {
-        "hours_today": totals.get("hours_today", 0),
-        "labour_cost_today": totals.get("labour_cost_today", 0),
-        "mtd_gm_pct": totals.get("mtd_gm_pct", 0),
-    }
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "totals": totals,
+            "now": datetime.now(),
+            # also pass directly in case a template references them from context
+            "fmt_currency": fmt_currency,
+            "fmt_pct": fmt_pct,
+            "fmt_int": fmt_int,
         },
     )
 
+# Try to import the ingest module if present
+try:
+    from . import ingest  # your existing ingest module
+except Exception:
+    ingest = None
+
 @app.post("/ingest/live")
 def run_live():
-    """
-    Intentionally return HTTP 200 even on failures so the UI never shows a raw 500.
-    Check the 'ok' flag and 'note' in the JSON body to see what happened.
-    """
-    try:
-        res = ingest.ingest_live(budget_sec=25)  # <-- signature accepts budget_sec
-    except Exception as e:
-        log.exception("ingest/live failed")
-        res = {
-            "ok": False,
-            "elapsed_sec": 0,
-            "jobs_inserted": 0,
-            "jobs_tried": 0,
-            "run_id": -1,
-            "note": "exception",
-            "detail": str(e),
-        }
-    # Always 200; client logic should look at res["ok"]
-    return JSONResponse(res, status_code=200)
+    started = time.time()
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    if ingest is None or not hasattr(ingest, "ingest_live"):
+        logger.error("ingest_live not available")
+        return JSONResponse(
+            {"ok": False, "error": "ingest_live not available", "elapsed_sec": 0.0},
+            status_code=200,
+        )
+
+    try:
+        fn = ingest.ingest_live
+        # Call signature-compatible: with budget_sec if supported, else without
+        if "budget_sec" in inspect.signature(fn).parameters:
+            res = fn(budget_sec=int(os.getenv("INGEST_BUDGET_SEC", "25")))
+        else:
+            res = fn()
+
+        elapsed = round(time.time() - started, 3)
+        if isinstance(res, dict):
+            res.setdefault("elapsed_sec", elapsed)
+            res.setdefault("ok", res.get("ok", True))
+            return JSONResponse(res, status_code=200)
+        else:
+            return JSONResponse({"ok": True, "result": str(res), "elapsed_sec": elapsed}, status_code=200)
+    except Exception as e:
+        logger.exception("ingest/live failed")
+        return JSONResponse({"ok": False, "error": str(e), "elapsed_sec": round(time.time() - started, 3)}, status_code=200)
