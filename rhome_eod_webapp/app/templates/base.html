@@ -1,17 +1,26 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>RHOME EOD</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link href="/static/styles.css" rel="stylesheet" />
-  </head>
-  <body>
-    <header>
-      <h1>RHOME EOD Dashboard</h1>
-    </header>
-    <main>
-      {% block content %}{% endblock %}
-    </main>
-  </body>
+<head>
+  <meta charset="utf-8" />
+  <title>RHome EOD Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <style>
+    /* safe minimal defaults if /static/styles.css is absent */
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); }
+    .card { padding: 14px; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
+    .label { color:#666; font-size: 12px; text-transform: uppercase; letter-spacing:.04em; }
+    .value { font-size: 24px; font-weight: 700; }
+    .muted { color:#888; font-size:12px; }
+    button { padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; background:#f8f8f8; cursor:pointer; }
+    pre { background:#f6f8fa; padding:12px; border-radius:8px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    {% block content %}{% endblock %}
+  </div>
+</body>
 </html>
