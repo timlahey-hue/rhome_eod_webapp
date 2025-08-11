@@ -1,119 +1,121 @@
-import os
-import sqlite3
+# app/main.py
 import logging
-import inspect
+import sqlite3
+from pathlib import Path
 from typing import Dict, Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from starlette.templating import Jinja2Templates
 
-# IMPORTANT: relative import so we definitely load *our* ingest module
-from . import ingest
+from . import ingest  # our local ingest.py
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
+log = logging.getLogger("app")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
+)
 
 app = FastAPI()
 
-# Static & templates
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
+# Static files (if you have app/static)
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-# ---- jinja helpers both as filters AND as context callables ----
-def fmt_currency(v) -> str:
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+# ---- Jinja filters (fixes 'fmt_currency' / 'fmt_pct' undefined) ----
+def fmt_currency(value):
     try:
-        return f"${float(v):,.0f}"
+        if value is None:
+            return "$0"
+        return "${:,.0f}".format(float(value))
     except Exception:
         return "$0"
 
-def fmt_pct(v) -> str:
+def fmt_pct(value):
     try:
-        return f"{float(v) * 100:.1f}%"
+        if value is None:
+            return "0%"
+        return "{:.0f}%".format(float(value) * 100 if float(value) <= 1 else float(value))
     except Exception:
-        return "0.0%"
+        return "0%"
 
 templates.env.filters["fmt_currency"] = fmt_currency
 templates.env.filters["fmt_pct"] = fmt_pct
 
-DB_PATH = os.getenv("DB_PATH", "eod.db")
+# ---- DB helpers ----
+DB_PATH = Path(__file__).parent.parent / "eod.db"
 
 def get_totals() -> Dict[str, Any]:
+    if not DB_PATH.exists():
+        log.error("get_totals(): DB file not found at %s; returning empty dict", DB_PATH)
+        return {}
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        con = sqlite3.connect(str(DB_PATH))
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        # If 'totals' table doesn't exist, handle gracefully
         cur.execute("""
             SELECT
-                labour_cost_today,
                 hours_today,
+                labour_cost_today,
                 mtd_gm_pct
             FROM totals
-            ORDER BY id DESC
+            ORDER BY asof DESC
             LIMIT 1
         """)
         row = cur.fetchone()
-        conn.close()
-        if not row:
-            return {}
-        return dict(row)
+        con.close()
+        return dict(row) if row else {}
     except sqlite3.OperationalError as e:
-        # 'no such table: totals' etc.
-        logger.error("app:get_totals(): 'totals' table not found; returning empty dict")
-        return {}
-    except Exception as e:
-        logger.exception("app:get_totals() failed; returning empty totals")
-        return {}
+        if "no such table: totals" in str(e).lower():
+            log.error("get_totals(): 'totals' table not found; returning empty dict")
+            return {}
+        raise
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/")
+# ---- Routes ----
+@app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     totals = get_totals()
-    # Pass the callables into the context since your templates call fmt_* like functions
+    # Provide defaults so the template always renders
+    totals = {
+        "hours_today": totals.get("hours_today", 0),
+        "labour_cost_today": totals.get("labour_cost_today", 0),
+        "mtd_gm_pct": totals.get("mtd_gm_pct", 0),
+    }
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
-            "totals": totals or {},
-            "fmt_currency": fmt_currency,
-            "fmt_pct": fmt_pct,
+            "totals": totals,
         },
     )
 
 @app.post("/ingest/live")
 def run_live():
     """
-    Call the ingest layer. Returns JSON no matter what.
-    Backwards compatible with either ingest_live(budget_sec=) or ingest_live(budget=).
-    Also normalizes odd return types.
+    Intentionally return HTTP 200 even on failures so the UI never shows a raw 500.
+    Check the 'ok' flag and 'note' in the JSON body to see what happened.
     """
     try:
-        # Prefer the new keyword
-        res = ingest.ingest_live(budget_sec=25)
-    except TypeError:
-        # Older module that only accepts 'budget'
-        res = ingest.ingest_live(budget=25)
+        res = ingest.ingest_live(budget_sec=25)  # <-- signature accepts budget_sec
     except Exception as e:
-        logger.exception("app:ingest/live failed")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        log.exception("ingest/live failed")
+        res = {
+            "ok": False,
+            "elapsed_sec": 0,
+            "jobs_inserted": 0,
+            "jobs_tried": 0,
+            "run_id": -1,
+            "note": "exception",
+            "detail": str(e),
+        }
+    # Always 200; client logic should look at res["ok"]
+    return JSONResponse(res, status_code=200)
 
-    # If some old version returns a tuple, coerce to dict
-    if isinstance(res, tuple):
-        res = res[0] if res and isinstance(res[0], dict) else {"ok": False, "error": "Unexpected tuple from ingest"}
-
-    if not isinstance(res, dict):
-        res = {"ok": False, "error": f"Unexpected return type from ingest: {type(res).__name__}"}
-
-    status = 200 if res.get("ok") else 502
-    return JSONResponse(res, status_code=status)
-
-# Log exactly which ingest module & signature we loaded, to end the “which version is running?” confusion.
-logger.info("Using ingest module: %s", getattr(ingest, "__file__", "unknown"))
-try:
-    logger.info("ingest.ingest_live signature: %s", inspect.signature(ingest.ingest_live))
-except Exception:
-    pass
+@app.get("/health")
+def health():
+    return {"ok": True}
