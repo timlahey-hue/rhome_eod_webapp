@@ -1,93 +1,128 @@
-# app/main.py
 import os
 import time
 import logging
 import sqlite3
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
-log = logging.getLogger("app")
-if not log.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:app:%(message)s")
+logger = logging.getLogger("app")
+logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"))
+
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.environ.get(
+    "EOD_DB_PATH",
+    os.path.abspath(os.path.join(BASE_DIR, "..", "eod.db"))
+)
 
 app = FastAPI()
 
-# Static + templates
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
+# Static & templates
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
-def fmt_currency(value) -> str:
+# ---- Safe formatters (make 500s impossible if values are None/missing)
+def fmt_currency(x):
     try:
-        return f"${float(value):,.0f}"
+        x = 0 if x is None else x
+        return "${:,.0f}".format(float(x))
     except Exception:
-        return "$0"
+        return "-"
 
-# Make fmt_currency available in templates regardless of how they're written
-templates.env.globals["fmt_currency"] = fmt_currency
-templates.env.filters["currency"] = fmt_currency
+def fmt_pct(x, places=1):
+    try:
+        if x is None:
+            return "-"
+        return f"{float(x) * 100:.{places}f}%"
+    except Exception:
+        return "-"
 
-# DB path; Render symlinks /data/eod.db -> ./eod.db
-DB_PATH = "eod.db" if os.path.exists("eod.db") else os.getenv("EOD_DB_PATH", "eod.db")
+def fmt_int(x):
+    try:
+        if x is None:
+            return "0"
+        return f"{int(round(float(x))):,}"
+    except Exception:
+        return "-"
+
+# Expose helpers to Jinja (both as globals and filters so either call style works)
+templates.env.globals.update(fmt_currency=fmt_currency, fmt_pct=fmt_pct, fmt_int=fmt_int)
+templates.env.filters.update(currency=fmt_currency, pct=fmt_pct, intfmt=fmt_int)
+
+def ensure_db():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS totals (
+                key   TEXT PRIMARY KEY,
+                value REAL
+            )
+        """)
+        con.commit()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
 def get_totals():
     try:
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
-        cur.execute("""
-            SELECT labour_cost_today, jobs_completed_today
-            FROM totals
-            ORDER BY id DESC
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        con.close()
-        if not row:
+        try:
+            cur.execute("SELECT key, value FROM totals")
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            logger.error("get_totals(): 'totals' table not found; returning empty dict")
             return {}
-        return {"labour_cost_today": row[0], "jobs_completed_today": row[1]}
-    except sqlite3.OperationalError:
-        log.error("get_totals(): 'totals' table not found; returning empty dict")
+        return {k: v for (k, v) in rows}
+    except Exception as e:
+        logger.exception("get_totals(): unexpected error")
         return {}
-    except Exception:
-        log.exception("get_totals() failed; returning empty totals")
-        return {}
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+@app.on_event("startup")
+def on_startup():
+    ensure_db()
+    logger.info("Startup OK. DB at %s", DB_PATH)
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "time": int(time.time())}
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     totals = get_totals()
+    # NOTE: fmt_* helpers are registered globally, so template can call fmt_currency(...), fmt_pct(...), etc.
     return templates.TemplateResponse(
         "index.html",
-        {"request": request, "totals": totals, "now": int(time.time())},
+        {"request": request, "totals": totals, "now": int(time.time())}
     )
 
-# Try both package and plain import so we work in all layouts
+# ---- Ingest endpoints (always present)
 try:
-    from . import ingest as ingest_mod  # type: ignore
-except Exception as e:
-    log.error("failed to import .ingest: %s", e)
-    try:
-        import ingest as ingest_mod  # type: ignore
-    except Exception as e2:
-        log.error("also failed to import ingest: %s", e2)
-        ingest_mod = None  # type: ignore
+    from .ingest import ingest_live as _ingest_live, ingest_diag as _ingest_diag
+except Exception as ex:
+    logger.error("ingest functions not available at startup: %s", ex)
+    _ingest_live = None
+    _ingest_diag = None
 
 @app.post("/ingest/live")
-def run_live():
-    if not ingest_mod or not hasattr(ingest_mod, "ingest_live"):
-        log.error("ingest_live not available")
-        return JSONResponse({"ok": False, "error": "ingest_live not available", "elapsed_sec": 0.0})
-    try:
-        # Prefer new signature; fall back if older ingest is deployed
-        try:
-            res = ingest_mod.ingest_live(budget_sec=25)  # type: ignore
-        except TypeError:
-            res = ingest_mod.ingest_live()  # type: ignore
-        return JSONResponse(res)
-    except Exception as e:
-        log.exception("ingest/live failed")
-        return JSONResponse({"ok": False, "error": str(e)})
+def ingest_live_endpoint():
+    if _ingest_live is None:
+        logger.error("ingest_live not available")
+        return JSONResponse({"ok": False, "error": "ingest_live not available"}, status_code=200)
+    return JSONResponse(_ingest_live(), status_code=200)
+
+@app.get("/ingest/diag")
+def ingest_diag_endpoint():
+    if _ingest_diag is None:
+        logger.error("ingest_diag not available")
+        return JSONResponse({"ok": False, "error": "ingest_diag not available"}, status_code=200)
+    return JSONResponse(_ingest_diag(), status_code=200)
