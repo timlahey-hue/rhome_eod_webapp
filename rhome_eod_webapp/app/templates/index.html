@@ -1,33 +1,59 @@
 {% extends "base.html" %}
 {% block content %}
 
-<div class="cards">
+<h1>RHome EOD Dashboard</h1>
+<p class="muted">Last refresh: {{ now }}</p>
+
+<div class="grid">
   <div class="card">
     <div class="label">Labour $ Today</div>
-    <div class="value">{{ fmt_currency(totals.get('labour_cost_today')) }}</div>
+    <div class="value">{{ fmt_currency(totals.get('labour_cost_today', 0)) }}</div>
   </div>
-  <div class="card">
-    <div class="label">Revenue Today</div>
-    <div class="value">{{ fmt_currency(totals.get('revenue_today')) }}</div>
-  </div>
-  <div class="card">
-    <div class="label">MTD Revenue</div>
-    <div class="value">{{ fmt_currency(totals.get('mtd_revenue')) }}</div>
-  </div>
+
   <div class="card">
     <div class="label">MTD GM%</div>
     <div class="value">{{ fmt_pct(totals.get('mtd_gm_pct')) }}</div>
   </div>
+
+  <div class="card">
+    <div class="label">Revenue Today</div>
+    <div class="value">{{ fmt_currency(totals.get('revenue_today', 0)) }}</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Revenue MTD</div>
+    <div class="value">{{ fmt_currency(totals.get('revenue_mtd', 0)) }}</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Jobs Completed Today</div>
+    <div class="value">{{ fmt_num(totals.get('jobs_completed_today', 0)) }}</div>
+  </div>
 </div>
 
-<section style="margin-top: 2rem;">
-  <form method="post" action="/ingest/live">
-    <button type="submit">Run Live Ingest</button>
-  </form>
-  <p style="margin-top: .5rem; font-size: .9rem; opacity:.8;">
-    Tip: set <code>SIMPRO_API_BASE</code> (e.g. <code>https://api-us.simprocloud.com/v1.0</code>) and optionally
-    <code>SIMPRO_COMPANY_ID</code> in your Render env. Auth uses <code>SIMPRO_TENANT_BASE</code> (e.g. <code>https://rhome.simprosuite.com</code>).
-  </p>
-</section>
+<hr style="margin:24px 0;" />
+
+<h3>Ingest</h3>
+<p class="muted">Click to run a quick ingest probe. This never throws a 500 — it will return a JSON result indicating success or exactly what failed.</p>
+<p>
+  <button id="runIngest">Run Ingest Probe</button>
+</p>
+<pre id="ingestOut"></pre>
+
+<script>
+const btn = document.getElementById('runIngest');
+const out = document.getElementById('ingestOut');
+
+btn?.addEventListener('click', async () => {
+  out.textContent = 'Running...';
+  try {
+    const res = await fetch('/ingest/live', { method: 'POST' });
+    const data = await res.json();
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    out.textContent = 'Request failed: ' + e;
+  }
+});
+</script>
 
 {% endblock %}
