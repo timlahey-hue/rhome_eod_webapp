@@ -1,271 +1,258 @@
 import os
-import json
 import time
+import json
 import logging
+from typing import Dict, Tuple, Any, List, Optional
+from urllib.parse import urljoin
+
 import sqlite3
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
-
 import requests
+from datetime import datetime, timezone
 
-log = logging.getLogger("ingest")
-if not log.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger("ingest")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:ingest:%(message)s")
 
-# ----- Config helpers ---------------------------------------------------------
+DB_PATH = os.getenv("DB_PATH", "eod.db")
 
-def _env(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name, default)
-    if v is None:
+# ---- Env helpers -------------------------------------------------------------
+
+def _require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
         raise RuntimeError(f"Missing required environment variable: {name}")
-    return v
+    return val
 
-def _db_conn() -> sqlite3.Connection:
-    db_path = os.getenv("DB_PATH", "./eod.db")
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
+def _normalized_base() -> Tuple[str, str]:
+    """
+    Returns (TENANT_BASE, API_BASE)
+    - SIMPRO_TENANT_BASE is required, like https://yourtenant.simprosuite.com
+    - SIMPRO_API_BASE is optional; if not supplied, default to TENANT_BASE + '/api/v1.0'
+    """
+    tenant_base = _require_env("SIMPRO_TENANT_BASE").rstrip("/")
+    api_base = os.getenv("SIMPRO_API_BASE", tenant_base + "/api/v1.0").rstrip("/")
+    return tenant_base, api_base
+
+def _join(base: str, path: str) -> str:
+    # urljoin is a bit odd with trailing slashes; ensure we keep our own semantics
+    base = base.rstrip("/")
+    path = path.lstrip("/")
+    return f"{base}/{path}"
+
+
+# ---- DB helpers --------------------------------------------------------------
+
+def _conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_tables(conn)
     return conn
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
-    # raw landing table (safe regardless of your existing UI schema)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS simpro_jobs_raw (
+        CREATE TABLE IF NOT EXISTS ingest_run (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id TEXT,
-            payload TEXT NOT NULL,
-            inserted_at TEXT NOT NULL
-        )
-    """)
-    # optional minimal ingest log
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS ingest_runs (
-            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at TEXT NOT NULL,
-            finished_at TEXT NOT NULL,
-            ok INTEGER NOT NULL,
-            note TEXT
-        )
+            finished_at TEXT,
+            ok INTEGER NOT NULL DEFAULT 0,
+            note TEXT,
+            jobs_tried INTEGER NOT NULL DEFAULT 0,
+            jobs_inserted INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    # Very minimal jobs table; if you already have one, this won’t overwrite it.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id INTEGER PRIMARY KEY,
+            number TEXT,
+            name TEXT,
+            status TEXT,
+            scheduled_date TEXT,
+            updated_at TEXT
+        );
     """)
     conn.commit()
 
-# ----- Simpro API client ------------------------------------------------------
 
-class SimproClient:
-    def __init__(self):
-        self.tenant_base = _env("SIMPRO_TENANT_BASE").rstrip("/")
-        self.oauth_url = f"{self.tenant_base}/api/oauth/token"
-        # Official API base is /api/v1.0
-        self.api_base = f"{self.tenant_base}/api/v1.0"
-        self.client_id = _env("SIMPRO_CLIENT_ID")
-        self.client_secret = _env("SIMPRO_CLIENT_SECRET")
-        self.username = _env("SIMPRO_USERNAME")
-        self.password = _env("SIMPRO_PASSWORD")
-        self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json"})
+# ---- Simpro API --------------------------------------------------------------
 
-    def token(self) -> str:
-        log.info("[ingest] Authenticating with Simpro")
-        data = {
-            "grant_type": "password",
-            "username": self.username,
-            "password": self.password,
-            # scope is often optional, include if your tenant requires it:
-            # "scope": "offline_access",
-        }
+def _get_token(tenant_base: str) -> Tuple[bool, str, Optional[str]]:
+    """
+    OAuth2 client_credentials token
+    POST {tenant}/oauth2/token  (Basic auth with client_id/secret)
+    """
+    client_id = _require_env("SIMPRO_CLIENT_ID")
+    client_secret = _require_env("SIMPRO_CLIENT_SECRET")
+
+    token_url = _join(tenant_base, "/oauth2/token")
+    try:
+        logger.info("[ingest] Authenticating with Simpro")
         resp = requests.post(
-            self.oauth_url,
-            data=data,
-            auth=(self.client_id, self.client_secret),
-            timeout=20,
+            token_url,
+            data={"grant_type": "client_credentials"},
+            auth=(client_id, client_secret),
+            timeout=30,
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"OAuth failed ({resp.status_code}): {resp.text[:300]}")
-        tok = resp.json().get("access_token")
-        if not tok:
-            raise RuntimeError("OAuth response missing access_token")
-        self.session.headers["Authorization"] = f"Bearer {tok}"
-        log.info("[ingest] Token acquired (len=%d)", len(tok))
-        return tok
-
-    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any, str]:
-        url = f"{self.api_base}{path}"
-        r = self.session.get(url, params=params or {}, timeout=30)
-        ctype = r.headers.get("content-type", "")
-        body = r.text
-        try:
-            payload = r.json() if "application/json" in ctype else None
-        except Exception:
-            payload = None
-        return r.status_code, payload, body
-
-    # --- discovery helpers ---
-
-    def list_companies(self) -> List[Dict[str, Any]]:
-        # Try GET /companies
-        code, js, body = self.get("/companies")
-        if code == 200 and isinstance(js, list):
-            return js
-        # Some builds may expose company on /current-user
-        code, js, body = self.get("/current-user")
-        if code == 200 and isinstance(js, dict):
-            # try common shapes
-            if "companies" in js and isinstance(js["companies"], list):
-                return js["companies"]
-            if "companyId" in js:
-                return [{"id": js["companyId"]}]
-        raise RuntimeError(f"Could not list companies (status={code}). Body starts: {body[:300]}")
-
-    def list_jobs_first_page(self, company_id: int) -> Tuple[int, Any, str]:
-        # Per Simpro v1.0, jobs live under /companies/{companyId}/jobs
-        return self.get(f"/companies/{company_id}/jobs", params={})
-        # If your tenant requires different pagination, add:
-        # params={"Page": 1, "PageSize": 100}
-
-# ----- Public functions used by FastAPI routes --------------------------------
-
-def check_api() -> Dict[str, Any]:
-    """
-    Return a diagnostic object showing status codes for:
-    - /info
-    - /companies
-    - /companies/{companyId}/jobs (if we can determine a company)
-    """
-    started = time.time()
-    client = SimproClient()
-    out: Dict[str, Any] = {
-        "ok": False,
-        "base": client.api_base,
-        "checks": [],
-    }
-    try:
-        client.token()
-        # /info
-        code, js, body = client.get("/info")
-        out["checks"].append({"path": "/info", "status": code})
-        # /companies
-        companies: List[Dict[str, Any]] = []
-        try:
-            companies = client.list_companies()
-            out["checks"].append({"path": "/companies", "status": 200, "count": len(companies)})
-        except Exception as e:
-            out["checks"].append({"path": "/companies", "status": "error", "error": str(e)})
-
-        # jobs (first page)
-        comp_id_env = os.getenv("SIMPRO_COMPANY_ID", "").strip()
-        company_id: Optional[int] = None
-        if comp_id_env != "":
-            try:
-                company_id = int(comp_id_env)
-            except Exception:
-                pass
-        if company_id is None and companies:
-            # take the first company if present
-            cid = companies[0].get("id") or companies[0].get("companyId")
-            if cid is not None:
-                try:
-                    company_id = int(cid)
-                except Exception:
-                    pass
-
-        if company_id is not None:
-            code, js, body = client.list_jobs_first_page(company_id)
-            out["checks"].append({"path": f"/companies/{company_id}/jobs", "status": code})
-            if code == 404:
-                # Record first 200 chars to help diagnose base URL issues
-                out["note"] = f"jobs 404 - body starts: {body[:200]}"
-        else:
-            out["note"] = "No company id available; set SIMPRO_COMPANY_ID or ensure /companies works."
-
-        out["ok"] = True
-        return out
-    finally:
-        out["elapsed_sec"] = round(time.time() - started, 2)
-
-def ingest_live() -> Dict[str, Any]:
-    """
-    Fetch first page of jobs and land raw JSON rows into SQLite.
-    """
-    started = datetime.now(timezone.utc)
-    conn = _db_conn()
-    _ensure_tables(conn)
-
-    client = SimproClient()
-    try:
-        client.token()
+            return False, f"oauth_status_{resp.status_code}", None
+        token = resp.json().get("access_token")
+        if not token:
+            return False, "oauth_missing_token", None
+        logger.info("[ingest] Token acquired (len=%s)", len(token))
+        return True, "ok", token
     except Exception as e:
-        return {"ok": False, "elapsed_sec": 0, "jobs_inserted": 0, "jobs_tried": 0, "note": f"oauth_failed: {e}"}
+        return False, f"oauth_exc_{type(e).__name__}", None
 
-    # Work out company id
-    comp_id_env = os.getenv("SIMPRO_COMPANY_ID", "").strip()
-    company_id: Optional[int] = None
-    if comp_id_env != "":
+
+def _api_get(api_base: str, token: str, path: str, params: Dict[str, Any]) -> requests.Response:
+    url = _join(api_base, path)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    return requests.get(url, headers=headers, params=params, timeout=30)
+
+
+def _fetch_jobs_page(api_base: str, token: str, page: int = 1, page_size: int = 50) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    """
+    Try the Jobs listing with conservative defaults. Different tenants sometimes
+    expose slightly different query param names. We try a couple of common ones
+    before giving up so you don’t get a hard 404.
+    """
+    tried = []
+
+    # Attempt 1: PageNumber / PageSize (most common)
+    resp = _api_get(api_base, token, "/jobs", {"PageNumber": page, "PageSize": page_size})
+    tried.append(("PageNumber/PageSize", resp.status_code))
+    if resp.status_code == 200:
         try:
-            company_id = int(comp_id_env)
+            data = resp.json()
+            # Data may be list or an envelope with 'items' or 'data'
+            if isinstance(data, list):
+                return True, "ok", data
+            if isinstance(data, dict):
+                for key in ("items", "data", "results"):
+                    if key in data and isinstance(data[key], list):
+                        return True, "ok", data[key]
+                # If dict but unknown shape, still return empty list
+                return True, "ok", []
         except Exception:
-            return {"ok": False, "elapsed_sec": 0, "jobs_inserted": 0, "jobs_tried": 0, "note": "SIMPRO_COMPANY_ID must be an integer"}
+            return False, "jobs_json_error", []
 
-    if company_id is None:
+    # Attempt 2: page/size (fallback)
+    resp2 = _api_get(api_base, token, "/jobs", {"page": page, "size": page_size})
+    tried.append(("page/size", resp2.status_code))
+    if resp2.status_code == 200:
         try:
-            companies = client.list_companies()
-            cid = companies[0].get("id") or companies[0].get("companyId")
-            company_id = int(cid) if cid is not None else None
-        except Exception as e:
-            return {"ok": False, "elapsed_sec": 0, "jobs_inserted": 0, "jobs_tried": 0, "note": f"companies_failed: {e}"}
+            data = resp2.json()
+            if isinstance(data, list):
+                return True, "ok", data
+            if isinstance(data, dict):
+                for key in ("items", "data", "results"):
+                    if key in data and isinstance(data[key], list):
+                        return True, "ok", data[key]
+                return True, "ok", []
+        except Exception:
+            return False, "jobs_json_error", []
 
-    # Fetch jobs (first page)
-    code, js, body = client.list_jobs_first_page(company_id)
-    if code == 404:
-        # This is the situation you’re seeing now – wrong base/path
-        return {"ok": False, "elapsed_sec": 0.0, "jobs_inserted": 0, "jobs_tried": 0, "run_id": None, "note": "api_status_404 - check SIMPRO_TENANT_BASE and that /api/v1.0/companies/{companyId}/jobs exists", "body_snippet": body[:200]}
-    if code != 200 or not isinstance(js, list):
-        return {"ok": False, "elapsed_sec": 0.0, "jobs_inserted": 0, "jobs_tried": 0, "run_id": None, "note": f"jobs_get_failed status={code} body_starts={body[:200]}"}
+    # If we got here, surface the most helpful detail (404 HTML pages happen when base path is wrong)
+    if resp.status_code == 404 or resp2.status_code == 404:
+        snippet = ""
+        try:
+            # In case the server returned an HTML 404 body, keep it short
+            snippet = resp.text[:300] if resp.status_code == 404 else resp2.text[:300]
+        except Exception:
+            pass
+        logger.warning("[ingest] jobs page %s returned 404: %s", page, ("\n\t" + snippet if snippet else ""))
+        return False, "api_status_404", []
 
-    # Insert
+    return False, f"jobs_status_{resp2.status_code}", []
+
+
+def _insert_jobs(conn: sqlite3.Connection, items: List[Dict[str, Any]]) -> int:
+    if not items:
+        return 0
     inserted = 0
-    tried = 0
-    now = datetime.now(timezone.utc).isoformat()
-    for job in js:
-        tried += 1
-        job_id = None
-        for k in ("id", "Id", "jobId", "JobId", "jobID", "JobID"):
-            if isinstance(job, dict) and k in job:
-                job_id = str(job[k])
-                break
+    for it in items:
+        # Safely pick some common fields if they exist; ignore the rest.
+        job_id = it.get("id") or it.get("jobId") or it.get("JobId")
+        number = it.get("number") or it.get("jobNumber") or it.get("JobNumber")
+        name = it.get("name") or it.get("jobName") or it.get("JobName")
+        status = it.get("status") or it.get("statusName") or it.get("Status")
+        scheduled = (
+            it.get("scheduledDate")
+            or it.get("startDate")
+            or it.get("JobDate")
+            or it.get("date")
+        )
+        updated = it.get("updatedAt") or it.get("lastModified") or datetime.now(timezone.utc).isoformat()
+
+        # If we can’t find a numeric ID we’ll skip to avoid PK conflicts
+        if job_id is None:
+            continue
+
         conn.execute(
-            "INSERT INTO simpro_jobs_raw(job_id, payload, inserted_at) VALUES (?,?,?)",
-            (job_id, json.dumps(job), now),
+            """
+            INSERT INTO jobs(job_id, number, name, status, scheduled_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                number=excluded.number,
+                name=excluded.name,
+                status=excluded.status,
+                scheduled_date=excluded.scheduled_date,
+                updated_at=excluded.updated_at
+            """,
+            (job_id, number, name, status, scheduled, updated),
         )
         inserted += 1
     conn.commit()
+    return inserted
 
-    finished = datetime.now(timezone.utc)
-    conn.execute(
-        "INSERT INTO ingest_runs(started_at, finished_at, ok, note) VALUES (?,?,?,?)",
-        (started.isoformat(), finished.isoformat(), 1, f"inserted={inserted}, tried={tried}")
-    )
-    conn.commit()
 
-    return {
-        "ok": True,
-        "elapsed_sec": round((finished - started).total_seconds(), 2),
-        "jobs_inserted": inserted,
-        "jobs_tried": tried,
-    }
+# ---- Public entrypoint -------------------------------------------------------
 
-# Simple demo that just seeds a couple of rows locally (no API call)
-def ingest_demo() -> Dict[str, Any]:
-    conn = _db_conn()
-    _ensure_tables(conn)
-    now = datetime.now(timezone.utc).isoformat()
-    sample = [
-        {"id": 1001, "name": "Demo Job A", "status": "In Progress"},
-        {"id": 1002, "name": "Demo Job B", "status": "Completed"},
-    ]
-    for j in sample:
-        conn.execute(
-            "INSERT INTO simpro_jobs_raw(job_id, payload, inserted_at) VALUES (?,?,?)",
-            (str(j["id"]), json.dumps(j), now),
-        )
-    conn.commit()
-    return {"ok": True, "elapsed_sec": 0.0, "jobs_inserted": len(sample), "jobs_tried": len(sample), "note": "demo"}
+def ingest_live() -> Tuple[bool, str, int, int]:
+    """
+    Returns (ok, note, jobs_inserted, jobs_tried)
+
+    Note strings:
+      - 'ok'                     → success
+      - 'api_status_404'         → base path likely wrong (set SIMPRO_API_BASE)
+      - 'oauth_*'                → auth problem
+      - 'jobs_status_*'          → non-200 listing response
+      - 'jobs_json_error'        → invalid JSON shape
+      - 'exc_*'                  → unexpected exception
+    """
+    start = time.time()
+    tenant_base, api_base = _normalized_base()
+
+    try:
+        ok, note, token = _get_token(tenant_base)
+        if not ok or not token:
+            logger.info("[ingest] ingest_live finished in %.2fs (ok=%s, jobs=0, tried=0)", time.time() - start, ok)
+            return False, note, 0, 0
+
+        logger.info("[ingest] Starting live ingest (budget=25s)")
+        with _conn() as conn:
+            total_inserted = 0
+            tried = 0
+
+            # Page once for now (you can loop pages if needed)
+            ok_jobs, note_jobs, items = _fetch_jobs_page(api_base, token, page=1, page_size=50)
+            tried += 1
+            if not ok_jobs:
+                elapsed = time.time() - start
+                logger.info("[ingest] ingest_live finished in %.2fs (ok=%s, jobs=%s, tried=%s)", elapsed, False, 0, tried)
+                return False, note_jobs, 0, tried
+
+            inserted = _insert_jobs(conn, items)
+            total_inserted += inserted
+
+        elapsed = time.time() - start
+        logger.info("[ingest] ingest_live finished in %.2fs (ok=%s, jobs=%s, tried=%s)", elapsed, True, total_inserted, tried)
+        return True, "ok", total_inserted, tried
+
+    except Exception as e:
+        elapsed = time.time() - start
+        logger.exception("Unexpected error during ingest")
+        return False, f"exc_{type(e).__name__}", 0, 0
